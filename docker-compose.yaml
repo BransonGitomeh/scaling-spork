@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  # Node.js application service
+  node-app:
+    build: .
+    container_name: node-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"  # Map port 3000 on host to port 3000 in the container
+    volumes:
+      - .:/app       # Mount the current directory to /app in the container
+      - /app/node_modules  # Avoid overwriting node_modules in the container
+    environment:
+      - NODE_ENV=development
+
+  # Portainer service for container management
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    ports:
+      - "9000:9000"  # Portainer web UI
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Access Docker daemon
+      - portainer_data:/data  # Persistent storage for Portainer
+
+# Volumes for persistent data
+volumes:
+  portainer_data:
