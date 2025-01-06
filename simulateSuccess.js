@@ -426,7 +426,7 @@ async function runSimulationInStages(startingCapital, targetGoal, winrate, lever
 }
 
 // Example usage
-const innitialStartingCapital = 0.49; // Initial capital in USDT
-const targetGoal = math.bignumber(5.03); // Final goal in USDT
+const innitialStartingCapital = 1.00; // Initial capital in USDT
+const targetGoal = math.bignumber(5); // Final goal in USDT
 
 runSimulationInStages(innitialStartingCapital, targetGoal, winrate, leverage);

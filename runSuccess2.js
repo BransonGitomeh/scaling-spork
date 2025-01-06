@@ -351,7 +351,7 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
     async function getBinanceServerTime() {
         try {
             const serverTime = await binance.futuresTime();
-            return serverTime.serverTime;
+            return serverTime?.serverTime;
         } catch (error) {
             console.error('Error fetching Binance server time:', error);
             throw error;
@@ -359,220 +359,234 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
     }
 
     const monitorOpenPositions = async () => {
-        // try {
-        // Fetch Binance server time
-        const timestamp = await getBinanceServerTime();
-        const recvWindow = 10000; // 10 seconds
+        try {
+            // Fetch Binance server time
+            const timestamp = await getBinanceServerTime();
+            const recvWindow = 10000; // 10 seconds
 
-        // Fetch open positions with correct timestamp and recvWindow
-        const openPositions = await binance.futuresPositionRisk({ symbol, timestamp, recvWindow });
-        if (openPositions.code) {
-            console.error(`Error fetching positions: ${openPositions.msg}`);
-            return false; // Return false to indicate an error
-        }
-
-        // Filter active positions with non-zero quantity
-        const activePositions = openPositions.filter(pos => parseFloat(pos.positionAmt) !== 0);
-
-        // Fetch current market direction
-        const currentTradeDirection = await decideTradeDirection();
-
-        for (const position of activePositions) {
-            console.log(`Monitoring active position for ${position.symbol}...`);
-
-            let positionClosed = false;
-            while (!positionClosed) {
-                // Fetch updated positions and balance with correct timestamp and recvWindow
-                const [updatedPositions, balance] = await Promise.all([
-                    binance.futuresPositionRisk({ symbol: position.symbol, timestamp, recvWindow }),
-                    binance.futuresBalance({ timestamp, recvWindow })
-                ]);
-
-                if (updatedPositions.code) {
-                    console.error(`Error fetching positions risk: ${updatedPositions.msg}`);
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                    continue;
-                }
-
-                const currentPosition = updatedPositions.find(pos => parseFloat(pos.positionAmt) !== 0);
-
-                if (!currentPosition) {
-                    // Position is closed
-                    positionClosed = true;
-                    sound.play("/Users/_bran/Documents/Trading/coin-flip-88793.mp3");
-
-                    // Update capital and fees
-                    const newCapital = parseFloat(balance.find(asset => asset.asset === 'USDT').balance);
-                    const profitLoss = math.subtract(math.bignumber(newCapital), previousCapital);
-                    capital = newCapital;
-
-                    const entryFeeAmount = math.multiply(previousCapital, 0.00018);
-                    const exitFeeAmount = math.multiply(math.abs(profitLoss), 0.00045);
-                    totalFees = math.add(totalFees, math.add(entryFeeAmount, exitFeeAmount));
-                    capital = math.subtract(math.add(capital, profitLoss), math.add(entryFeeAmount, exitFeeAmount));
-
-                    // Determine if the trade was a win or loss
-                    const isWin = math.larger(profitLoss, 0);
-
-                    // Update win/loss counters and trend strength
-                    if (isWin) {
-                        consecutiveWins = math.add(consecutiveWins, 1);
-                        consecutiveLosses = math.bignumber(0);
-                        profitableTrades++;
-                        trendStrength = math.min(math.add(trendStrength, 1), math.bignumber(5)); // Increase trend strength on win
-                    } else {
-                        consecutiveLosses = math.add(consecutiveLosses, 1);
-                        consecutiveWins = math.bignumber(0);
-                        trendStrength = math.max(math.subtract(trendStrength, 1), math.bignumber(-5)); // Decrease trend strength on loss
-                    }
-
-                    // Update high water mark
-                    if (math.larger(capital, highWaterMark)) {
-                        highWaterMark = capital;
-                    }
-
-                    //Define positionSize based on the absolute value of the position amount
-                    const positionSize = math.abs(parseFloat(position.positionAmt)); // Calculate the size of the position
-
-
-                    // Determine if the closed position was long or short
-                    const wasLong = parseFloat(position.positionAmt) > 0; // Check if the position was long
-
-                    // Update long/short trade tracking
-                    if (wasLong) {
-                        totalLongs++;
-                        totalLongsPnl = math.add(totalLongsPnl, profitLoss);
-                        totalLongsSize = math.add(totalLongsSize, positionSize);
-                        totalLongsFees = math.add(totalLongsFees, math.add(entryFeeAmount, exitFeeAmount));
-                        totalLongsNotionalSize = math.add(totalLongsNotionalSize, leveragedAmount);
-                        totalLongsMargin = math.add(totalLongsMargin, exposedAmount);
-                        totalLongsMarginRatio = math.add(totalLongsMarginRatio, math.divide(exposedAmount, capital));
-                        totalLongsPnlROI = math.add(totalLongsPnlROI, math.divide(profitLoss, exposedAmount));
-                    } else {
-                        totalShorts++;
-                        totalShortsPnl = math.add(totalShortsPnl, profitLoss);
-                        totalShortsSize = math.add(totalShortsSize, positionSize);
-                        totalShortsFees = math.add(totalShortsFees, math.add(entryFeeAmount, exitFeeAmount));
-                        totalShortsNotionalSize = math.add(totalShortsNotionalSize, leveragedAmount);
-                        totalShortsMargin = math.add(totalShortsMargin, exposedAmount);
-                        totalShortsMarginRatio = math.add(totalShortsMarginRatio, math.divide(exposedAmount, capital));
-                        totalShortsPnlROI = math.add(totalShortsPnlROI, math.divide(profitLoss, exposedAmount));
-                    }
-
-                    // Update total PnL and fees
-                    totalPnL = math.add(totalPnL, profitLoss);
-                    totalFeesCombined = math.add(totalFeesCombined, math.add(entryFeeAmount, exitFeeAmount));
-
-                    // Log trade details
-                    trades.push({
-                        index: totalTrades,
-                        side: tradeDirection.toLowerCase(),
-                        symbol: "DEGOUSDT", // Example symbol
-                        leverage: `x${leverage}`,
-                        balance: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)}`,
-                        balanceChange: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)} (${math.larger(capital, previousCapital) ? '+' : ''}${(math.number(math.subtract(capital, previousCapital)) / math.number(previousCapital) * 100).toFixed(2)}%)`,
-                        fees: `$ ${math.number(math.add(entryFeeAmount, exitFeeAmount)).toFixed(3)}`,
-                        entryFee: math.number(entryFeeAmount),
-                        exitFee: math.number(exitFeeAmount),
-                        rawPnl: math.number(profitLoss).toFixed(4),
-                        tradeSize: math.number(positionSize),
-                        size: `${math.round(notionalSize / markPrice) > 0 ? math.round(notionalSize / markPrice) : 1} contracts`, // Use notionalSize for contract size
-                        notionalSize: `${math.number(notionalSize).toFixed(3)}`, // Use notionalSize here
-                        margin: math.number(exposedAmount).toFixed(3),
-                        marginRatio: math.number(math.multiply(math.divide(exposedAmount, capital), 100)).toFixed(3),
-                        pnlROI: math.number(math.multiply(math.divide(profitLoss, exposedAmount), 100)).toFixed(4),
-                        entryPrice: math.number(entryPrice),
-                        breakEvenPrice: math.number(entryPrice), // Simplified break-even price
-                        markPrice: math.number(markPrice),
-                        liqPrice: math.number(markPrice * (1 - (1 / leverage))).toFixed(4), // Simplified liquidation price
-                        tpSlInfo: `TP: $ ${math.number(tpPrice).toFixed(2)}, SL: $ ${math.number(slPrice).toFixed(2)}`,
-                        exposedAmount: `$ ${math.number(exposedAmount).toFixed(2)} (${(math.number(positionSize) * 100).toFixed(2)}% balance $ ${math.number(previousCapital).toFixed(2)})`,
-                    });
-
-                    // Check for excessive drawdown (stop if max drawdown exceeded)
-                    const drawdown = math.subtract(1, math.divide(capital, highWaterMark));
-                    if (math.larger(drawdown, maxDrawdown) || math.smaller(capital, 0)) {
-                        console.log(chalk.red("\nMax drawdown exceeded or allocated capital depleted. Stopping simulation."));
-                        console.log(chalk.gray(`Current Capital: `) + chalk.red(currencyFormatterUSD(math.number(capital))));
-                        console.log(chalk.gray(`High Water Mark: `) + chalk.green(currencyFormatterUSD(math.number(highWaterMark))));
-                        console.log(chalk.gray(`Drawdown: `) + chalk.red(`${math.number(math.multiply(drawdown, 100)).toFixed(2)}%`));
-                        console.log(chalk.gray(`Max Drawdown Allowed: `) + chalk.red(`${math.number(math.multiply(maxDrawdown, 100)).toFixed(2)}%\n`));
-                        return false;
-                    }
-
-                    return true; // Signal that the position is closed
-                }
-
-                // Determine the position's direction (long or short)
-                const positionDirection = parseFloat(currentPosition.positionAmt) > 0 ? 'long' : 'short';
-
-                // Determine action and calculate prices
-                const isShort = currentTradeDirection?.toLowerCase() === 'short';
-
-                // Opposite action: SELL for long, BUY for short
-                const oppositeAction = isShort ? 'BUY' : 'SELL';
-
-                // Log if market direction changes
-                if (currentTradeDirection && positionDirection?.toLowerCase() !== currentTradeDirection?.toLowerCase()) {
-                    console.log(`Market direction changed from ${positionDirection.toUpperCase()} to ${currentTradeDirection}.`);
-                    sound.play("/Users/_bran/Documents/Trading/e-piano-key-note-f_95bpm_F_minor.wav");
-                    //  return false
-                    // Prepare orders to close the position
-                    const closeOrders = [
-                        {
-                            symbol,
-                            side: oppositeAction, // Opposite of the current position's direction
-                            type: "MARKET",
-                            quantity: math.number(math.abs(parseFloat(currentPosition.positionAmt))).toString(), // Use the absolute value of positionAmt
-                        },
-                    ];
-
-                    // Execute the close orders
-                    const closeResponse = await binance.futuresMultipleOrders(closeOrders);
-
-                    let allCloseOrdersSuccessful = true;
-
-                    closeResponse.forEach((order, index) => {
-                        if (order.code) {
-                            // Handle failed orders
-                            console.error(`Error in closing order ${index + 1}: ${order.msg}`);
-                            allCloseOrdersSuccessful = false; // Flag error
-                        } else {
-                            // Handle successful orders
-                            console.log(`Closing order ${index + 1} placed successfully:`, {
-                                orderId: order.orderId,
-                                symbol: order.symbol,
-                                status: order.status,
-                                side: order.side,
-                                type: order.type,
-                                quantity: order.origQty,
-                                price: order.price,
-                                time: new Date(order.updateTime).toLocaleString(),
-                            });
-                        }
-                    });
-
-                    if (allCloseOrdersSuccessful) {
-                        sound.play("/Users/_bran/Documents/Trading/effect_notify-84408.mp3");
-                        console.log("Position closed successfully.");
-                    } else {
-                        console.error("Failed to close the position.");
-                    }
-                }
-
-                // Update previous direction
-                previousDirection = currentTradeDirection;
-
-                // Wait before checking again
-                await new Promise(resolve => setTimeout(resolve, 1000));
+            // Fetch open positions with correct timestamp and recvWindow
+            const openPositions = await binance.futuresPositionRisk({ symbol, timestamp, recvWindow });
+            if (openPositions.code) {
+                console.error(`Error fetching positions: ${openPositions.msg}`);
+                return false; // Return false to indicate an error
             }
-        }
 
-        return false; // No position was closed
-        // } catch (error) {
-        //     console.error('Error monitoring positions:', error);
-        //     return false; // Signal an error
-        // }
+            // Filter active positions with non-zero quantity
+            const activePositions = openPositions.filter(pos => parseFloat(pos.positionAmt) !== 0);
+
+
+
+            for (const position of activePositions) {
+                console.log(`Monitoring active position for ${position.symbol}...`);
+
+                let positionClosed = false;
+                while (!positionClosed) {
+                    // Fetch current market direction
+                    const currentTradeDirection = await decideTradeDirection();
+                    const markPrice = await fetchMarkPrice(); // Example current price
+
+                    // Fetch updated positions and balance with correct timestamp and recvWindow
+                    const [updatedPositions, balance] = await Promise.all([
+                        binance.futuresPositionRisk({ symbol: position.symbol, timestamp, recvWindow }),
+                        binance.futuresBalance({ timestamp, recvWindow })
+                    ]);
+
+                    if (updatedPositions.code) {
+                        console.error(`Error fetching positions risk: ${updatedPositions.msg}`);
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        continue;
+                    }
+
+                    const currentPosition = updatedPositions.find(pos => parseFloat(pos.positionAmt) !== 0);
+
+                    if (!currentPosition) {
+                        // Position is closed
+                        positionClosed = true;
+                        sound.play("/Users/_bran/Documents/Trading/coin-flip-88793.mp3");
+
+                        // Update capital and fees
+                        const newCapital = parseFloat(balance.find(asset => asset.asset === 'USDT').balance);
+                        const profitLoss = math.subtract(math.bignumber(newCapital), previousCapital);
+                        capital = newCapital;
+
+                        const entryFeeAmount = math.multiply(previousCapital, 0.00018);
+                        const exitFeeAmount = math.multiply(math.abs(profitLoss), 0.00045);
+                        totalFees = math.add(totalFees, math.add(entryFeeAmount, exitFeeAmount));
+                        capital = math.subtract(math.add(capital, profitLoss), math.add(entryFeeAmount, exitFeeAmount));
+
+                        // Determine if the trade was a win or loss
+                        const isWin = math.larger(profitLoss, 0);
+
+                        // Update win/loss counters and trend strength
+                        if (isWin) {
+                            consecutiveWins = math.add(consecutiveWins, 1);
+                            consecutiveLosses = math.bignumber(0);
+                            profitableTrades++;
+                            trendStrength = math.min(math.add(trendStrength, 1), math.bignumber(5)); // Increase trend strength on win
+                        } else {
+                            consecutiveLosses = math.add(consecutiveLosses, 1);
+                            consecutiveWins = math.bignumber(0);
+                            trendStrength = math.max(math.subtract(trendStrength, 1), math.bignumber(-5)); // Decrease trend strength on loss
+                        }
+
+                        // Update high water mark
+                        if (math.larger(capital, highWaterMark)) {
+                            highWaterMark = capital;
+                        }
+
+                        // Log trade details and other updates...
+
+                        //Define positionSize based on the absolute value of the position amount
+                        const positionSize = math.abs(parseFloat(position.positionAmt)); // Calculate the size of the position
+                        let exposedAmount = math.multiply(capital, positionSize);
+                        let leveragedAmount = math.multiply(exposedAmount, leverageBN); // Leveraged exposure
+
+                        // Calculate exposure and fees
+                        let notionalSize = math.multiply(capital, math.multiply(positionSize, leverage));
+
+
+                        // Determine if the closed position was long or short
+                        const wasLong = parseFloat(position.positionAmt) > 0; // Check if the position was long
+
+                        // Update long/short trade tracking
+                        if (wasLong) {
+                            totalLongs++;
+                            totalLongsPnl = math.add(totalLongsPnl, profitLoss);
+                            totalLongsSize = math.add(totalLongsSize, positionSize);
+                            totalLongsFees = math.add(totalLongsFees, math.add(entryFeeAmount, exitFeeAmount));
+                            totalLongsNotionalSize = math.add(totalLongsNotionalSize, leveragedAmount);
+                            totalLongsMargin = math.add(totalLongsMargin, exposedAmount);
+                            totalLongsMarginRatio = math.add(totalLongsMarginRatio, math.divide(exposedAmount, capital));
+                            totalLongsPnlROI = math.add(totalLongsPnlROI, math.divide(profitLoss, exposedAmount));
+                        } else {
+                            totalShorts++;
+                            totalShortsPnl = math.add(totalShortsPnl, profitLoss);
+                            totalShortsSize = math.add(totalShortsSize, positionSize);
+                            totalShortsFees = math.add(totalShortsFees, math.add(entryFeeAmount, exitFeeAmount));
+                            totalShortsNotionalSize = math.add(totalShortsNotionalSize, leveragedAmount);
+                            totalShortsMargin = math.add(totalShortsMargin, exposedAmount);
+                            totalShortsMarginRatio = math.add(totalShortsMarginRatio, math.divide(exposedAmount, capital));
+                            totalShortsPnlROI = math.add(totalShortsPnlROI, math.divide(profitLoss, exposedAmount));
+                        }
+
+                        // Update total PnL and fees
+                        totalPnL = math.add(totalPnL, profitLoss);
+                        totalFeesCombined = math.add(totalFeesCombined, math.add(entryFeeAmount, exitFeeAmount));
+
+                        // Log trade details
+                        trades.push({
+                            index: totalTrades,
+                            side: currentTradeDirection?.toLowerCase(),
+                            symbol: "DEGOUSDT", // Example symbol
+                            leverage: `x${leverage}`,
+                            balance: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)}`,
+                            balanceChange: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)} (${math.larger(capital, previousCapital) ? '+' : ''}${(math.number(math.subtract(capital, previousCapital)) / math.number(previousCapital) * 100).toFixed(2)}%)`,
+                            fees: `$ ${math.number(math.add(entryFeeAmount, exitFeeAmount)).toFixed(3)}`,
+                            entryFee: math.number(entryFeeAmount),
+                            exitFee: math.number(exitFeeAmount),
+                            rawPnl: math.number(profitLoss).toFixed(4),
+                            tradeSize: math.number(positionSize),
+                            size: `${math.round(notionalSize / markPrice) > 0 ? math.round(notionalSize / markPrice) : 1} contracts`, // Use notionalSize for contract size
+                            notionalSize: `${math.number(notionalSize).toFixed(3)}`, // Use notionalSize here
+                            margin: math.number(exposedAmount).toFixed(3),
+                            marginRatio: math.number(math.multiply(math.divide(exposedAmount, capital), 100)).toFixed(3),
+                            pnlROI: math.number(math.multiply(math.divide(profitLoss, exposedAmount), 100)).toFixed(4),
+                            // entryPrice: math.number(entryPrice),
+                            // breakEvenPrice: math.number(entryPrice), // Simplified break-even price
+                            markPrice: math.number(markPrice),
+                            liqPrice: math.number(markPrice * (1 - (1 / leverage))).toFixed(4), // Simplified liquidation price
+                            // tpSlInfo: `TP: $ ${math.number(tpPrice).toFixed(2)}, SL: $ ${math.number(slPrice).toFixed(2)}`,
+                            exposedAmount: `$ ${math.number(exposedAmount).toFixed(2)} (${(math.number(positionSize) * 100).toFixed(2)}% balance $ ${math.number(previousCapital).toFixed(2)})`,
+                        });
+
+                        console.log(chalkTable(tableOptions, trades))
+
+                        // Check for excessive drawdown (stop if max drawdown exceeded)
+                        const drawdown = math.subtract(1, math.divide(capital, highWaterMark));
+                        if (math.larger(drawdown, maxDrawdown) || math.smaller(capital, 0)) {
+                            console.log(chalk.red("\nMax drawdown exceeded or allocated capital depleted. Stopping simulation."));
+                            console.log(chalk.gray(`Current Capital: `) + chalk.red(currencyFormatterUSD(math.number(capital))));
+                            console.log(chalk.gray(`High Water Mark: `) + chalk.green(currencyFormatterUSD(math.number(highWaterMark))));
+                            console.log(chalk.gray(`Drawdown: `) + chalk.red(`${math.number(math.multiply(drawdown, 100)).toFixed(2)}%`));
+                            console.log(chalk.gray(`Max Drawdown Allowed: `) + chalk.red(`${math.number(math.multiply(maxDrawdown, 100)).toFixed(2)}%\n`));
+                            return false; // Stop Trading
+                        }
+
+                        return true; // Keep trading
+                    }
+
+                    // Determine the position's direction (long or short)
+                    const positionDirection = parseFloat(currentPosition.positionAmt) > 0 ? 'long' : 'short';
+
+                    // Determine action and calculate prices
+                    const isShort = positionDirection?.toLowerCase() === 'short';
+
+                    // Opposite action: SELL for long, BUY for short
+                    const oppositeAction = isShort ? 'BUY' : 'SELL';
+
+                    // Log if market direction changes
+                    if (currentTradeDirection && positionDirection?.toLowerCase() !== currentTradeDirection?.toLowerCase()) {
+                        console.log(`Market direction changed from ${positionDirection.toUpperCase()} to ${currentTradeDirection}.`);
+                        sound.play("/Users/_bran/Documents/Trading/e-piano-key-note-f_95bpm_F_minor.wav");
+
+                        // Prepare orders to close the position
+                        const closeOrders = [
+                            {
+                                symbol,
+                                side: oppositeAction, // Opposite of the current position's direction
+                                type: "MARKET",
+                                quantity: math.number(math.abs(parseFloat(currentPosition.positionAmt))).toString(), // Use the absolute value of positionAmt
+                            },
+                        ];
+
+                        // Execute the close orders
+                        const closeResponse = await binance.futuresMultipleOrders(closeOrders);
+
+                        let allCloseOrdersSuccessful = true;
+
+                        closeResponse.forEach((order, index) => {
+                            if (order.code) {
+                                // Handle failed orders
+                                console.error(`Error in closing order ${index + 1}: ${order.msg}`);
+                                allCloseOrdersSuccessful = false; // Flag error
+                            } else {
+                                // Handle successful orders
+                                console.log(`Closing order ${index + 1} placed successfully:`, {
+                                    orderId: order.orderId,
+                                    symbol: order.symbol,
+                                    status: order.status,
+                                    side: order.side,
+                                    type: order.type,
+                                    quantity: order.origQty,
+                                    price: order.price,
+                                    time: new Date(order.updateTime).toLocaleString(),
+                                });
+                            }
+                        });
+
+                        if (allCloseOrdersSuccessful) {
+                            sound.play("/Users/_bran/Documents/Trading/effect_notify-84408.mp3");
+                            console.log("Position closed successfully.");
+                            positionClosed = true; // Set positionClosed to true to exit the loop
+                            return true; // Signal that the position is closed
+                        } else {
+                            console.error("Failed to close the position.");
+                        }
+                    }
+
+                    // Update previous direction
+                    previousDirection = currentTradeDirection;
+
+                    // Wait before checking again
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+
+            return false; // No position was closed
+        } catch (error) {
+            console.error('Error monitoring positions:', error);
+            return false; // Signal an error
+        }
     };
 
 
@@ -584,10 +598,12 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
 
             // Check if there are any open positions on Binance
             const openPositions = await binance.futuresPositionRisk({ symbol: symbol, timestamp, recvWindow });
+            const markPrice = await fetchMarkPrice(); // Example current price
 
             if (openPositions.code) {
                 console.error(`Error fetching positions: ${openPositions.msg}`);
-                return false; // Stop execution on error
+                await new Promise(resolve => setTimeout(resolve, 5000)); // Wait before retrying
+                return false; // Skip this iteration and retry
             }
 
             // Filter active positions with non-zero quantity
@@ -597,6 +613,7 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
                 // Monitor the existing position
                 console.log('An open position already exists. Monitoring the position...');
                 await monitorOpenPositions();
+                console.log('Position monitoring completed. Checking for new trading opportunities...');
                 return true; // Continue the loop after monitoring
             }
 
@@ -650,7 +667,6 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
             const goLong = currentTradeDirection.toLowerCase() === 'long';
 
             // Set markPrice and calculate TP and SL based on the trade direction
-            const markPrice = await fetchMarkPrice(); // Example current price
             let tpPrice, slPrice;
 
             // Set markPrice and calculate TP and SL based on the trade direction
@@ -845,6 +861,10 @@ let totalShortsPnlROI = math.bignumber(0);
 let savings = math.bignumber(0);
 let savingsRate = 0.2; // Save 20% of profits at the end of each stage
 
+// Total PnL and Fees
+let totalPnL = math.bignumber(0);
+let totalFeesCombined = math.bignumber(0);
+
 
 async function runSimulationInStages(startingCapital, targetGoal, winrate, leverage) {
     let currentCapital = math.bignumber(startingCapital);
@@ -942,7 +962,7 @@ async function runSimulationInStages(startingCapital, targetGoal, winrate, lever
 }
 
 // Example usage
-const innitialStartingCapital = 0.3; // Initial capital in USDT
+const innitialStartingCapital = 0.2; // Initial capital in USDT
 const targetGoal = math.bignumber(100.00); // Final goal in USDT
 
 runSimulationInStages(innitialStartingCapital, targetGoal, winrate, leverage);
