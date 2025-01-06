@@ -297,6 +297,8 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
             if (response.code) {
                 throw new Error(`API Error: ${response.msg} (Code: ${response.code})`);
             }
+
+            console.log(response)
     
             // Find the object in the array that matches the given symbol
             const symbolData = response.find(item => item.symbol === symbol);
