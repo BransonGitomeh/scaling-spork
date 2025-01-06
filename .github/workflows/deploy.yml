@@ -1,0 +1,35 @@
+name: Deploy to Google Cloud VM
+
+on:
+  push:
+    branches:
+      - main  # Trigger on pushes to the main branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the repository
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Authenticate with Google Cloud
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      # Set up Google Cloud SDK
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+
+      # SSH into the VM and run the deploy script
+      - name: Run deploy script
+        uses: google-github-actions/ssh-compute@v1
+        with:
+          instance_name: your-vm-instance-name  # Replace with your VM instance name
+          zone: your-vm-zone  # Replace with your VM's zone (e.g., us-central1-a)
+          command: |
+            cd scaling-spork  # Replace with the path to your project on the VM
+            ./deploy.sh
