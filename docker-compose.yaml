@@ -11,6 +11,10 @@ services:
       - /app/node_modules  # Avoid overwriting node_modules in the container
     environment:
       - NODE_ENV=development
+    logging:
+      driver: gcplogs
+      options:
+        gcp-project: wellwash-411511
 
   # Portainer service for container management
   portainer:
