@@ -14,4 +14,4 @@ RUN yarn install --frozen-lockfile
 COPY . .
 
 # Command to run your Node.js application
-CMD ["node", "your-app-file.js"]
+CMD ["node", "runSuccess2.js"]
