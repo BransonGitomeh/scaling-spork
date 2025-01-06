@@ -287,24 +287,30 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
     let profitableTrades = 0;
     let trendStrength = math.bignumber(0);  // Trend strength for win rate adjustment
 
+
     async function fetchMarkPrice() {
         try {
             // Fetch the mark price data for all symbols
             const response = await binance.futuresMarkPrice();
-
+    
+            // Check if the response contains an error code
+            if (response.code) {
+                throw new Error(`API Error: ${response.msg} (Code: ${response.code})`);
+            }
+    
             // Find the object in the array that matches the given symbol
             const symbolData = response.find(item => item.symbol === symbol);
-
+    
             // Check if the symbol data was found
             if (!symbolData) {
                 throw new Error(`Symbol ${symbol} not found in mark price data`);
             }
-
+    
             // Check if the mark price is available
             if (!symbolData.markPrice) {
                 throw new Error(`Failed to fetch mark price for symbol ${symbol}`);
             }
-
+    
             // Parse and return the mark price as a float
             const markPrice = parseFloat(symbolData.markPrice);
             return markPrice;
@@ -313,7 +319,6 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
             throw error; // Rethrow the error or return a fallback value if necessary
         }
     }
-
 
     const calculatePositionSize = () => {
         let positionSize = math.bignumber(basePositionSize); // Start with the base position size
