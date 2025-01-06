@@ -1,16 +1,30 @@
 version: '3.8'
 
 services:
-  # Node.js application service
-  node-app:
-    build: .
-    container_name: node-app
-    restart: unless-stopped
-    volumes:
-      - .:/app       # Mount the current directory to /app in the container
-      - /app/node_modules  # Avoid overwriting node_modules in the container
+  nordvpn:
+    image: bubuntux/nordvpn
+    container_name: nordvpn
     environment:
-      - NODE_ENV=development
+      - USERNAME=michaelrennie999@gmail.com  # Replace with your NordVPN username
+      - PASSWORD=Butterfly135!#%  # Replace with your NordVPN password
+      - COUNTRY=Japan           # Replace with your desired country
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    networks:
+      - vpn-network
+    restart: unless-stopped
+  node-app:
+    image: your-dockerhub-username/your-node-app:latest
+    build: .
+    depends_on:
+      - nordvpn
+    environment:
+      - NODE_ENV=production
+    networks:
+      - vpn-network
+    restart: unless-stopped
     logging:
       driver: gcplogs
       options:
@@ -30,3 +44,6 @@ services:
 # Volumes for persistent data
 volumes:
   portainer_data:
+networks:
+  vpn-network:
+    driver: bridge
