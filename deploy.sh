@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Variables
-PROJECT_DIR="/path/to/your/project"  # Replace with your project directory
+PROJECT_DIR="./"  # Replace with your project directory
 COMPOSE_FILE="docker-compose.yaml"   # Replace with your compose file name
 GIT_BRANCH="main"                    # Replace with your Git branch (e.g., main, master, etc.)
 
