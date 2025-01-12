@@ -17,6 +17,8 @@ const {
     sma,
     rsi,
     adx,
+    ema,
+    vwap
 } = require('trading-indicator');
 
 // Constants
@@ -70,6 +72,25 @@ function roundToTickSize(price, tickSize) {
     return Math.round(price / tickSize) * tickSize;
 }
 
+function summarizeWalls(walls) {
+    const deltas = walls.map((w) => w.delta);
+    const count = deltas.length;
+    const preview = deltas
+        .slice(0, MAX_WALLS_TO_SHOW)
+        .map((delta) => delta.toFixed(2));
+    const minDelta = Math.min(...deltas).toFixed(2);
+    const maxDelta = Math.max(...deltas).toFixed(2);
+    const avgDelta = (deltas.reduce((sum, d) => sum + d, 0) / count).toFixed(2);
+
+    return {
+        preview: preview.join(", "),
+        count,
+        min: minDelta,
+        max: maxDelta,
+        avg: avgDelta,
+    };
+}
+
 async function fetchOHLCVWithRetry(exchange, symbol, timeframe, retries = 30, delay = 1000) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
@@ -89,133 +110,545 @@ async function fetchOHLCVWithRetry(exchange, symbol, timeframe, retries = 30, de
     }
 }
 
+let previousState = {
+    volumes: { buyVolume: 0, sellVolume: 0 },
+    price: 0,
+    walls: { buyWalls: [], sellWalls: [] },
+};
+const MAX_WALLS_TO_SHOW = 3; // Limit the number of entries shown
 
-const decideTradeDirection = async () => {
-    const maPeriod = 7; // Moving Average period for short-term trend
-    const rsiPeriod = 7; // RSI period for overbought/oversold conditions
-    const adxPeriod = 7; // ADX period for trend strength
-    const atrPeriod = 7; // ATR period for volatility
-    const atrThreshold = 0.5; // Minimum volatility threshold for trading
-    const recentPeriodCount = 5; // Check the last 5 periods for confirmation
+// Analyze buy and sell wall changes
+const analyzeWallChanges = (buyWalls, sellWalls, previousState) => {
+    const buyWallChanges = buyWalls.map((wall, index) => {
+        const prevWall = previousState.walls?.buyWalls[index] || { q: 0 };
+        const currentQty = parseFloat(wall.q);
+        const prevQty = parseFloat(prevWall.q);
+        const delta = currentQty - prevQty;
+
+        return {
+            price: wall.p,
+            currentQty,
+            prevQty,
+            delta: isNaN(delta) ? 0 : delta,
+        };
+    });
+
+    const sellWallChanges = sellWalls.map((wall, index) => {
+        const prevWall = previousState.walls?.sellWalls[index] || { q: 0 };
+        const currentQty = parseFloat(wall.q);
+        const prevQty = parseFloat(prevWall.q);
+        const delta = currentQty - prevQty;
+
+        return {
+            price: wall.p,
+            currentQty,
+            prevQty,
+            delta: isNaN(delta) ? 0 : delta,
+        };
+    });
+
+    return { buyWallChanges, sellWallChanges };
+};
+
+// Log wall changes for better insights
+const logWallChanges = (buyWallChanges, sellWallChanges) => {
+    console.log('Buy Wall Changes:');
+    buyWallChanges.forEach((wall, index) => {
+        console.log(`Buy Wall ${index}: Price = ${wall.price}, Current Qty = ${wall.currentQty}, Previous Qty = ${wall.prevQty}, Delta = ${wall.delta.toFixed(2)}`);
+    });
+
+    console.log('Sell Wall Changes:');
+    sellWallChanges.forEach((wall, index) => {
+        console.log(`Sell Wall ${index}: Price = ${wall.price}, Current Qty = ${wall.currentQty}, Previous Qty = ${wall.prevQty}, Delta = ${wall.delta.toFixed(2)}`);
+    });
+};
+
+// Calculate percentile threshold for buy/sell orders
+const calculatePercentileThreshold = (orders, percentile) => {
+    if (!orders || orders.length === 0) {
+        console.warn('No orders provided for threshold calculation.');
+        return 0;
+    }
+
+    // Extract valid quantities
+    const quantities = orders
+        .map((order) => parseFloat(order.q))
+        .filter((q) => !isNaN(q) && q > 0); // Filter out invalid quantities
+
+    if (quantities.length === 0) {
+        console.warn('No valid quantities found in orders.');
+        return 0;
+    }
+
+    // Sort quantities in ascending order
+    quantities.sort((a, b) => a - b);
+
+    // Calculate the index for the given percentile
+    const index = Math.ceil((percentile / 100) * quantities.length) - 1;
+    return quantities[index] || 0;
+};
+
+const analyzeOrderBook = (orderBook) => {
+    // Extract bids and asks from the order book
+    const bids = orderBook.bids.map((bid) => ({ p: bid[0], q: bid[1] })); // Convert to { p, q } format
+    const asks = orderBook.asks.map((ask) => ({ p: ask[0], q: ask[1] })); // Convert to { p, q } format
+
+    // Cache best bid/ask and mid-price
+    const bestBid = bids.length > 0 ? Math.max(...bids.map((bid) => parseFloat(bid.p))) : 0;
+    const bestAsk = asks.length > 0 ? Math.min(...asks.map((ask) => parseFloat(ask.p))) : Infinity;
+    const midPrice = (bestBid + bestAsk) / 2;
+
+    // Calculate total buy and sell volume with validation
+    const buyVolume = bids.reduce((sum, bid) => {
+        const quantity = parseFloat(bid.q);
+        return sum + (isNaN(quantity) ? 0 : quantity); // Fallback to 0 if quantity is NaN
+    }, 0);
+
+    const sellVolume = asks.reduce((sum, ask) => {
+        const quantity = parseFloat(ask.q);
+        return sum + (isNaN(quantity) ? 0 : quantity); // Fallback to 0 if quantity is NaN
+    }, 0);
+
+    const totalVolume = buyVolume + sellVolume;
+
+    // Order Book Imbalance
+    const imbalance = (buyVolume - sellVolume) / totalVolume;
+
+    // VWAP Calculation (Volume-Weighted Average Price)
+    const vwap =
+        (bids.reduce((sum, bid) => sum + parseFloat(bid.p) * parseFloat(bid.q), 0) +
+            asks.reduce((sum, ask) => sum + parseFloat(ask.p) * parseFloat(ask.q), 0)) /
+        totalVolume;
+
+    // Price Clusters (zones of high liquidity)
+    const detectPriceClusters = (orders, threshold) => {
+        const priceBuckets = new Map();
+        orders.forEach((order) => {
+            const price = parseFloat(order.p);
+            const quantity = parseFloat(order.q);
+            if (!isNaN(price) && !isNaN(quantity)) { // Only process valid numbers
+                const bucket = Math.round(price / threshold) * threshold;
+                priceBuckets.set(bucket, (priceBuckets.get(bucket) || 0) + quantity);
+            }
+        });
+        return Array.from(priceBuckets.entries()).sort((a, b) => b[1] - a[1]);
+    };
+
+    const buyClusters = detectPriceClusters(bids, 0.5);
+    const sellClusters = detectPriceClusters(asks, 0.5);
+
+    // Detect price walls (large orders)
+    const detectPriceWalls = (orders, volumeThreshold) => {
+        if (!orders || orders.length === 0) {
+            console.warn('No orders provided for wall detection.');
+            return [];
+        }
+
+        return orders.filter((order) => {
+            const quantity = parseFloat(order.q);
+            return !isNaN(quantity) && quantity >= volumeThreshold; // Only include valid orders
+        });
+    };
+
+    // Example usage
+    const buyThreshold = calculatePercentileThreshold(bids, 95); // Top 10% of buy orders
+    const sellThreshold = calculatePercentileThreshold(asks, 95); // Top 10% of sell orders
+
+    const buyWalls = detectPriceWalls(bids, buyThreshold);
+    const sellWalls = detectPriceWalls(asks, sellThreshold);
+
+    const { buyWallChanges, sellWallChanges } = analyzeWallChanges(buyWalls, sellWalls, previousState);
+    logWallChanges(buyWallChanges, sellWallChanges);
+
+    // Order Flow Velocity (change in volume over time)
+    const orderFlowVelocity = {
+        buy: buyVolume - (previousState.volumes?.buyVolume || 0),
+        sell: sellVolume - (previousState.volumes?.sellVolume || 0),
+    };
+
+    // Wall Exhaustion Analysis (change in wall size over time)
+    const wallExhaustion = {
+        buy: buyWalls.map((wall, index) => {
+            const prevWall = previousState.walls?.buyWalls[index] || { q: 0 };
+            const currentQty = parseFloat(wall.q);
+            const prevQty = parseFloat(prevWall.q);
+
+            const delta = currentQty - prevQty;
+            return { price: wall.p, delta: isNaN(delta) ? 0 : delta }; // Handle invalid deltas
+        }),
+        sell: sellWalls.map((wall, index) => {
+            const prevWall = previousState.walls?.sellWalls[index] || { q: 0 };
+            const currentQty = parseFloat(wall.q);
+            const prevQty = parseFloat(prevWall.q);
+
+            const delta = currentQty - prevQty;
+            return { price: wall.p, delta: isNaN(delta) ? 0 : delta }; // Handle invalid deltas
+        }),
+    };
+
+    // Update previous state for the next iteration
+    previousState.walls = {
+        buyWalls: buyWalls,
+        sellWalls: sellWalls,
+    };
+
+    // Predictive Signal Generation
+    let signal = "Neutral";
+    const priceMovement = midPrice - (previousState.price || midPrice);
+    const volumeDelta = buyVolume - sellVolume;
+
+    if (volumeDelta > 100 && priceMovement > 0) signal = "Bullish Confirmation";
+    else if (volumeDelta < -100 && priceMovement < 0) signal = "Bearish Confirmation";
+
+    // === Extreme Prices and Quantities ===
+    const extremePrices = {
+        highestPrice: asks.length > 0 ? Math.max(...asks.map((ask) => parseFloat(ask.p))) : null,
+        lowestPrice: bids.length > 0 ? Math.min(...bids.map((bid) => parseFloat(bid.p)).filter((p) => !isNaN(p))) : null,
+    };
+
+    const extremeQuantities = {
+        highestPriceQuantity: asks.length > 0
+            ? asks.find((ask) => parseFloat(ask.p) === extremePrices.highestPrice)?.q || 0
+            : 0,
+        lowestPriceQuantity: bids.length > 0
+            ? bids.find((bid) => parseFloat(bid.p) === extremePrices.lowestPrice)?.q || 0
+            : 0,
+    };
+
+    // Log Outputs
+    console.log("\n=== Order Book Analysis ===");
+    console.log({
+        "Best Bid": bestBid.toFixed(4),
+        "Best Ask": bestAsk.toFixed(4),
+        "Mid Price": midPrice.toFixed(4),
+        "VWAP": vwap.toFixed(4),
+        "Imbalance": imbalance.toFixed(4),
+        "Signal": signal,
+    });
+
+    console.log("\n=== Order Flow Velocity ===");
+    console.log({
+        "Buy Flow": orderFlowVelocity.buy.toFixed(2),
+        "Sell Flow": orderFlowVelocity.sell.toFixed(2),
+    });
+
+    console.log("\n=== Price Clusters ===");
+    console.log({
+        "Buy Clusters": buyClusters.map(([price, volume]) => `${price}: ${volume.toFixed(2)}`),
+        "Sell Clusters": sellClusters.map(([price, volume]) => `${price}: ${volume.toFixed(2)}`),
+    });
+
+    console.log("\n=== Price Walls ===");
+    console.log({
+        "Buy Walls": buyWalls.map((wall) => {
+            const quantity = parseFloat(wall.q); // Convert to number
+            return `${wall.p}: ${isNaN(quantity) ? "N/A" : quantity}`; // Handle invalid numbers
+        }).join("\n"),
+        "Sell Walls": sellWalls.map((wall) => {
+            const quantity = parseFloat(wall.q); // Convert to number
+            return `${wall.p}: ${isNaN(quantity) ? "N/A" : quantity}`; // Handle invalid numbers
+        }).join("\n"),
+    });
+
+    console.log("\n=== Wall Exhaustion ===");
+    console.log({
+        "Buy Wall Deltas": wallExhaustion.buy.length > 0
+            ? wallExhaustion.buy.map((wall) => `${wall.price}: ${wall.delta.toFixed(2)}`).join("\n")
+            : "No buy wall deltas found",
+        "Sell Wall Deltas": wallExhaustion.sell.length > 0
+            ? wallExhaustion.sell.map((wall) => `${wall.price}: ${wall.delta.toFixed(2)}`).join("\n")
+            : "No sell wall deltas found",
+    });
+
+    console.log("\n=== Extreme Prices and Quantities ===");
+    console.log({
+        "Highest Price": extremePrices.highestPrice,
+        "Quantity at Highest Price": extremeQuantities.highestPriceQuantity,
+        "Lowest Price": extremePrices.lowestPrice,
+        "Quantity at Lowest Price": extremeQuantities.lowestPriceQuantity,
+    });
+
+    console.log("\n=== Trading Advice ===");
+    if (signal === "Bullish Confirmation") {
+        console.log("🟢 Strong Buy Signal: Consider entering a long position or adding to existing longs.");
+    } else if (signal === "Bearish Confirmation") {
+        console.log("🔴 Strong Sell Signal: Consider entering a short position or adding to existing shorts.");
+    } else {
+        console.log("🟡 Neutral Signal: Wait for clearer market direction.");
+    }
+
+    // Update previous state
+    previousState = {
+        price: midPrice,
+        volumes: { buyVolume, sellVolume },
+        walls: { buyWalls, sellWalls },
+    };
+
+    // Return analysis results
+    return {
+        bestBid,
+        bestAsk,
+        midPrice,
+        vwap,
+        imbalance,
+        buyClusters,
+        sellClusters,
+        buyWalls,
+        sellWalls,
+        orderFlowVelocity,
+        wallExhaustion,
+        signal,
+        volumes: { buyVolume, sellVolume },
+        price: midPrice,
+        extremePrices,
+        extremeQuantities,
+    };
+};
+
+let analyzeVolume = (aggTrades = [], openPosition = false) => {
+    // Extract volume data and calculate average volume
+    let volumeData = aggTrades.map((t) => parseFloat(t.q));
+    let avgVolume = volumeData.reduce((sum, v) => sum + v, 0) / volumeData.length;
+    let currentVolume = parseFloat(aggTrades[aggTrades.length - 1]?.q);
+
+    // Define thresholds for decision-making
+    const volumeSpikeThreshold = 1.5; // 150% of average volume
+    const volumeDropThreshold = 0.5; // 50% of average volume
+
+    // Analyze current volume relative to average
+    if (currentVolume > avgVolume * volumeSpikeThreshold) {
+        if (!openPosition) {
+            console.log("Entry Advice: Volume spike detected! Consider entering a trade.");
+        } else {
+            console.log("Position Management: Volume spike detected! Consider adding to your position or holding.");
+        }
+    } else if (currentVolume < avgVolume * volumeDropThreshold) {
+        if (openPosition) {
+            console.log("Position Management: Volume drop detected! Consider exiting or reducing your position.");
+        } else {
+            console.log("Entry Advice: Low volume detected. Avoid entering a trade.");
+        }
+    } else {
+        if (!openPosition) {
+            console.log("Entry Advice: Volume is normal. Wait for a better entry signal.");
+        } else {
+            console.log("Position Management: Volume is normal. Hold your position.");
+        }
+    }
+
+    // Return volume data for further analysis
+    return {
+        currentVolume,
+        avgVolume,
+        volumeData,
+    };
+};
+
+const cache = {
+    data: null,
+    timestamp: 0,
+    banUntil: 0,
+};
+
+let fetchOrderBookData = async (symbol) => {
+    // Check if we're banned or using cached data
+    const now = Date.now();
+    if (cache.banUntil > now) {
+        console.log(
+            chalk.yellow(
+                `Using cached data due to ban until ${new Date(cache.banUntil).toISOString()}`,
+            ),
+        );
+        return cache.data;
+    }
+
+    let orderBook = {
+        bids: [],
+        asks: [],
+    };
 
     try {
-        console.log('Starting trade direction decision process...');
+        // Fetch live order book data
+        orderBook = await binance.futuresDepth(symbol, { limit: 10 });
 
-        // Fetch input data for 1-minute and 3-minute timeframes for trend confirmation
-        console.log('Fetching the latest price data for 1-minute and 3-minute timeframes...');
-        const [{ input: input1m }, { input: input3m }] = await Promise.all([
-            fetchOHLCVWithRetry(exchange, symbol, '1m'), // 1-minute data with retry
-            fetchOHLCVWithRetry(exchange, symbol, '3m')  // 3-minute data with retry
-        ]);
+        // Cache the successful response
+        cache.data = { orderBook };
+        cache.timestamp = now;
+        cache.banUntil = 0; // Reset ban duration
+    } catch (err) {
+        console.error(chalk.red(`Error fetching order book data: ${err.message}`));
 
+        if (err.code == -1003 && err.msg.includes("Way too many requests")) {
+            // Extract ban timestamp if present
+            const banUntilMatch = err.msg.match(/banned until (\d+)/);
+            const banUntil = banUntilMatch
+                ? parseInt(banUntilMatch[1], 10)
+                : now + 60000; // Default ban: 1 minute
+            cache.banUntil = banUntil;
+            console.log(
+                chalk.yellow(
+                    `IP banned until ${new Date(cache.banUntil).toISOString()}. Using cached data.`,
+                ),
+            );
+        }
+
+        // Return cached data if available
+        if (cache.data) {
+            console.log(chalk.yellow("Returning cached data due to error."));
+            return cache.data;
+        }
+    }
+
+    return { orderBook };
+};
+
+
+
+const decideTradeDirection = async (hasOpenPosition = false, orderBook) => {
+    const emaPeriod1 = 5; // 5-period EMA
+    const emaPeriod2 = 8; // 8-period EMA
+    const emaPeriod3 = 13; // 13-period EMA
+    const rsiPeriod = 5; // RSI period for overbought/oversold conditions
+    const rsiThresholdUpper = 70; // Overbought threshold
+    const rsiThresholdLower = 30; // Oversold threshold
+    const adxPeriod = 5; // ADX period for trend strength
+    const adxThreshold = 30; // ADX threshold for strong trend
+
+    try {
+        console.log('\nStarting trade direction decision process...');
+
+        // Fetch input data for 1-minute timeframe
+        console.log('Fetching the latest price data for 1-minute timeframe...');
+        const { input: input1m } = await fetchOHLCVWithRetry(exchange, symbol, '5m'); // 1-minute data with retry
 
         // Validate input data to avoid errors in calculation
-        if (!input1m?.close?.length || !input3m?.close?.length) {
+        if (!input1m?.close?.length) {
             console.warn('Not enough data to make a decision. Skipping this cycle.');
             return null;
         }
 
-        // Calculate technical indicators for both timeframes
-        console.log('Calculating technical indicators (SMA, RSI, ADX, ATR) for both timeframes...');
-        const [sma1m, sma3m, rsi1m, rsi3m, adx1m, adx3m, atr1m, atr3m] = await Promise.all([
-            sma(maPeriod, 'close', input1m), // 1-minute SMA
-            sma(maPeriod, 'close', input3m), // 3-minute SMA
-            rsi(rsiPeriod, 'close', input1m), // 1-minute RSI
-            rsi(rsiPeriod, 'close', input3m), // 3-minute RSI
-            adx(adxPeriod, input1m), // 1-minute ADX
-            adx(adxPeriod, input3m), // 3-minute ADX
-            atr(atrPeriod, input1m), // 1-minute ATR
-            atr(atrPeriod, input3m)  // 3-minute ATR
+        // Calculate technical indicators for the 1-minute timeframe
+        console.log('Calculating technical indicators (EMA5, EMA8, EMA13, RSI, ADX) for 1-minute timeframe...');
+        const [ema5, ema8, ema13, rsi14, adx14] = await Promise.all([
+            ema(emaPeriod1, 'close', input1m), // 5-period EMA
+            ema(emaPeriod2, 'close', input1m), // 8-period EMA
+            ema(emaPeriod3, 'close', input1m), // 13-period EMA
+            rsi(rsiPeriod, 'close', input1m), // RSI
+            adx(adxPeriod, input1m) // ADX
         ]);
 
-        // Extract the last N values for decision making
-        const recentRSI1m = rsi1m.slice(-recentPeriodCount); // Last 5 periods of RSI for 1m
-        const recentRSI3m = rsi3m.slice(-recentPeriodCount); // Last 5 periods of RSI for 3m
-        const recentADX1m = adx1m.slice(-recentPeriodCount).map(a => a.adx); // Last 5 periods of ADX for 1m
-        const recentADX3m = adx3m.slice(-recentPeriodCount).map(a => a.adx); // Last 5 periods of ADX for 3m
-        const recentATR1m = atr1m.slice(-recentPeriodCount); // Last 5 periods of ATR for 1m
-        const recentATR3m = atr3m.slice(-recentPeriodCount); // Last 5 periods of ATR for 3m
+        // Extract the latest values
+        const latestClose = input1m.close[input1m.close.length - 1];
+        const latestEma5 = ema5[ema5.length - 1];
+        const latestEma8 = ema8[ema8.length - 1];
+        const latestEma13 = ema13[ema13.length - 1];
+        const latestRsi = rsi14[rsi14.length - 1];
+        const latestAdx = adx14[adx14.length - 1]; // Contains { adx, pdi, mdi }
 
-        // Log the latest values for transparency
-        console.log(`Evaluating last ${recentPeriodCount} periods...`);
-        console.log(`1-minute RSI: ${recentRSI1m.join(', ')}`);
-        console.log(`3-minute RSI: ${recentRSI3m.join(', ')}`);
-        console.log(`1-minute ADX: ${recentADX1m.join(', ')}`);
-        console.log(`3-minute ADX: ${recentADX3m.join(', ')}`);
-        console.log(`1-minute ATR: ${recentATR1m.join(', ')}`);
-        console.log(`3-minute ATR: ${recentATR3m.join(', ')}`);
+        console.log(`Latest Close: ${latestClose}`);
+        console.log(`Latest EMA5: ${latestEma5}`);
+        console.log(`Latest EMA8: ${latestEma8}`);
+        console.log(`Latest EMA13: ${latestEma13}`);
+        console.log(`Latest RSI: ${latestRsi}`);
+        console.log(`Latest ADX: ${latestAdx.adx}`);
+        console.log(`Latest PDI: ${latestAdx.pdi}`);
+        console.log(`Latest MDI: ${latestAdx.mdi}`);
 
-        // Determine the trend based on SMAs
-        console.log('Evaluating SMA for trend direction...');
-        const smaTrend1m = input1m.close[input1m.close.length - 1] > sma1m[sma1m.length - 1] ? 'LONG' : 'SHORT';
-        const smaTrend3m = input3m.close[input3m.close.length - 1] > sma3m[sma3m.length - 1] ? 'LONG' : 'SHORT';
+        // Determine the trend based on the 13-period EMA
+        const isUptrend = latestClose > latestEma13;
+        const isDowntrend = latestClose < latestEma13;
 
-        console.log(`1-minute SMA trend: ${smaTrend1m}`);
-        console.log(`3-minute SMA trend: ${smaTrend3m}`);
+        // Determine the trade direction based on EMA crossovers and trend
+        let tradeDirection = null;
 
-        // Check RSI for trend confirmation
-        console.log('Evaluating RSI for trend confirmation...');
-        // RSI Trend Confirmation with explicit long/short checks
-        const isRSIConfirmingLong = recentRSI1m.every(r => r > 55) && recentRSI3m.every(r => r > 55);
-        const isRSIConfirmingShort = recentRSI1m.every(r => r < 45) && recentRSI3m.every(r => r < 45);
-
-        // ADX for stronger trend confirmation
-        const isStrongTrend = recentADX1m.every(a => a > 25) && recentADX3m.every(a => a > 25);
-
-        // ATR for adaptive volatility check
-        const isVolatile = recentATR1m.every(a => a > atrThreshold) && recentATR3m.every(a => a > atrThreshold);
-
-        // Final decision based on multiple confirmations
-        if (smaTrend1m === 'LONG' && smaTrend3m === 'LONG') {
-            console.log(`Trade direction determined: ${smaTrend1m}.`);
-            console.log(`Reason:`);
-            console.log(`- SMA confirms a ${smaTrend1m} trend (1m SMA trend: ${smaTrend1m}, 3m SMA trend: ${smaTrend3m}).`);
-            console.log(`- RSI confirms a ${isRSIConfirmingLong} trend (1m RSI: ${recentRSI1m.join(', ')}, 3m RSI: ${recentRSI3m.join(', ')}).`);
-            console.log(`- ADX shows a strong trend (1m ADX: ${recentADX1m.join(', ')}, 3m ADX: ${recentADX3m.join(', ')}).`);
-            console.log(`- ATR indicates high volatility (1m ATR: ${recentATR1m.join(', ')}, 3m ATR: ${recentATR3m.join(', ')}).`);
-            return smaTrend1m;
-        } else if (smaTrend1m === 'SHORT' && smaTrend3m === 'SHORT') {
-            console.log(`Trade direction determined: ${smaTrend1m}.`);
-            console.log(`Reason:`);
-            console.log(`- SMA confirms a ${smaTrend1m} trend (1m SMA trend: ${smaTrend1m}, 3m SMA trend: ${smaTrend3m}).`);
-            console.log(`- RSI confirms a ${isRSIConfirmingLong} trend (1m RSI: ${recentRSI1m.join(', ')}, 3m RSI: ${recentRSI3m.join(', ')}).`);
-            console.log(`- ADX shows a strong trend (1m ADX: ${recentADX1m.join(', ')}, 3m ADX: ${recentADX3m.join(', ')}).`);
-            console.log(`- ATR indicates high volatility (1m ATR: ${recentATR1m.join(', ')}, 3m ATR: ${recentATR3m.join(', ')}).`);
-            return smaTrend1m;
-        } else {
-            console.log('No trade signal generated.');
-            console.log(`Reason:`);
-            // Log the status of each condition
-            if (smaTrend1m !== smaTrend3m) {
-                console.log(`- SMA trends do not match (1m SMA trend: ${smaTrend1m}, 3m SMA trend: ${smaTrend3m}).`);
-            }
-
-            if (!isRSIConfirmingLong) {
-                console.log(`- RSI does not confirm a trend (1m RSI: ${recentRSI1m.join(', ')}, 3m RSI: ${recentRSI3m.join(', ')}).`);
-            } else {
-                console.log(`- RSI confirms a ${isRSIConfirmingLong} trend (1m RSI: ${recentRSI1m.join(', ')}, 3m RSI: ${recentRSI3m.join(', ')}).`);
-            }
-
-            if (!isStrongTrend) {
-                console.log(`- ADX shows a weak trend (1m ADX: ${recentADX1m.join(', ')}, 3m ADX: ${recentADX3m.join(', ')}).`);
-            } else {
-                console.log(`- ADX shows a strong trend (1m ADX: ${recentADX1m.join(', ')}, 3m ADX: ${recentADX3m.join(', ')}).`);
-            }
-
-            if (!isVolatile) {
-                console.log(`- ATR indicates low volatility (1m ATR: ${recentATR1m.join(', ')}, 3m ATR: ${recentATR3m.join(', ')}).`);
-            } else {
-                console.log(`- ATR indicates high volatility (1m ATR: ${recentATR1m.join(', ')}, 3m ATR: ${recentATR3m.join(', ')}).`);
-            }
-
-            return null;
+        // Bullish signal: EMA5 crosses above EMA8 and both are above EMA13
+        if (latestEma5 > latestEma8 && latestEma8 > latestEma13 && isUptrend) {
+            console.log('Bullish signal detected: EMA5 crossed above EMA8 and both are above EMA13.');
+            tradeDirection = 'LONG';
         }
+        // Bearish signal: EMA5 crosses below EMA8 and both are below EMA13
+        else if (latestEma5 < latestEma8 && latestEma8 < latestEma13 && isDowntrend) {
+            console.log('Bearish signal detected: EMA5 crossed below EMA8 and both are below EMA13.');
+            tradeDirection = 'SHORT';
+        } else {
+            console.log('No EMA crossover detected or price is not aligned with the 13-period EMA. Market is likely consolidating.');
+        }
+
+        // Confirm the trend with RSI and ADX
+        if (tradeDirection === 'LONG') {
+            if (latestRsi > rsiThresholdUpper) {
+                console.log('RSI indicates overbought conditions. Cancelling LONG signal.');
+                tradeDirection = null;
+            } else if (latestAdx.adx < adxThreshold || latestAdx.pdi <= latestAdx.mdi) {
+                console.log('ADX indicates weak trend strength or PDI is not greater than MDI. Cancelling LONG signal.');
+                tradeDirection = null;
+            }
+        } else if (tradeDirection === 'SHORT') {
+            if (latestRsi < rsiThresholdLower) {
+                console.log('RSI indicates oversold conditions. Cancelling SHORT signal.');
+                tradeDirection = null;
+            } else if (latestAdx.adx < adxThreshold || latestAdx.mdi <= latestAdx.pdi) {
+                console.log('ADX indicates weak trend strength or MDI is not greater than PDI. Cancelling SHORT signal.');
+                tradeDirection = null;
+            }
+        }
+
+        // Analyze the live order book for additional signal filtering
+
+
+        let { orderBook } = await fetchOrderBookData(symbol);
+        const orderBookAnalysis = analyzeOrderBook(orderBook);
+
+        // Filter LONG signals using order book metrics
+        // if (tradeDirection === 'LONG') {
+        //     if (orderBookAnalysis.imbalance < 0) {
+        //         console.log('Order book shows sell-side imbalance. Cancelling LONG signal.');
+        //         tradeDirection = null;
+        //     } else if (latestClose < orderBookAnalysis.vwap) {
+        //         console.log('Price is below VWAP. Cancelling LONG signal.');
+        //         tradeDirection = null;
+        //     } else if (orderBookAnalysis.buyClusters.length === 0) {
+        //         console.log('No strong buy-side price clusters detected. Cancelling LONG signal.');
+        //         tradeDirection = null;
+        //     }
+        // }
+
+        // // Filter SHORT signals using order book metrics
+        // if (tradeDirection === 'SHORT') {
+        //     if (orderBookAnalysis.imbalance > 0) {
+        //         console.log('Order book shows buy-side imbalance. Cancelling SHORT signal.');
+        //         tradeDirection = null;
+        //     } else if (latestClose > orderBookAnalysis.vwap) {
+        //         console.log('Price is above VWAP. Cancelling SHORT signal.');
+        //         tradeDirection = null;
+        //     } else if (orderBookAnalysis.sellClusters.length === 0) {
+        //         console.log('No strong sell-side price clusters detected. Cancelling SHORT signal.');
+        //         tradeDirection = null;
+        //     }
+        // }
+
+
+        // If there is an open position, prioritize the current trend
+        if (hasOpenPosition) {
+            console.log('Open position detected. Prioritizing current trend...');
+            return tradeDirection; // Return the current trend directly
+        }
+
+        // Final decision
+        if (tradeDirection === 'LONG') {
+            console.log('Decision: Go LONG.');
+        } else if (tradeDirection === 'SHORT') {
+            console.log('Decision: Go SHORT.');
+        } else {
+            console.log('Decision: Stay in cash or wait for a clearer signal.');
+        }
+
+        return tradeDirection;
     } catch (error) {
         console.error('Error during trend determination:', error);
         return null;
     }
 };
-
 
 
 async function fetchSymbolPrecision(symbol) {
@@ -234,11 +667,49 @@ function roundToPrecision(value, precision) {
     return Math.round(value * factor) / factor;
 }
 
+const fetchTradeHistory = async (symbol, orderId) => {
+    try {
+        const timestamp = await getBinanceServerTime();
+        const recvWindow = 10000; // 10 seconds
+
+        // Fetch all trades for the symbol
+        const tradeHistory = await binance.futuresUserTrades(symbol);
+
+        if (tradeHistory.code) {
+            console.error(`Error fetching trade history: ${tradeHistory.msg}`);
+            return null;
+        }
+
+        // Find the trade with the specified orderId
+        const specificTrade = tradeHistory.find(trade => trade.orderId === orderId);
+
+        if (!specificTrade) {
+            console.log(`No trade found with orderId: ${orderId}`);
+            return null;
+        }
+
+        return specificTrade;
+    } catch (error) {
+        console.error('Error fetching trade history:', error);
+        return null;
+    }
+};
+
+async function getBinanceServerTime() {
+    try {
+        const serverTime = await binance.futuresTime();
+        return serverTime?.serverTime;
+    } catch (error) {
+        console.error('Error fetching Binance server time:', error);
+        throw error;
+    }
+}
 
 
 
 let previousCapital
 let previousDirection
+let previousBalance = math.bignumber(0);
 const simulateTradesWithRiskManagement = async (startingCapital, winrate, targetCapital, leverage) => {
     // Input validation
     if (!startingCapital || startingCapital <= 0) {
@@ -260,7 +731,8 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
     const capitalBN = math.bignumber(startingCapital);
     const targetCapitalBN = math.bignumber(targetCapital);
     const leverageBN = math.bignumber(leverage);
-    const winrateBN = math.bignumber(winrate);
+
+
 
     // Initialize core variables with BigNumber precision
     let capital = capitalBN;
@@ -292,27 +764,25 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
         try {
             // Fetch the mark price data for all symbols
             const response = await binance.futuresMarkPrice();
-    
+
             // Check if the response contains an error code
             if (response.code) {
                 throw new Error(`API Error: ${response.msg} (Code: ${response.code})`);
             }
 
-            console.log(response)
-    
             // Find the object in the array that matches the given symbol
             const symbolData = response.find(item => item.symbol === symbol);
-    
+
             // Check if the symbol data was found
             if (!symbolData) {
                 throw new Error(`Symbol ${symbol} not found in mark price data`);
             }
-    
+
             // Check if the mark price is available
             if (!symbolData.markPrice) {
                 throw new Error(`Failed to fetch mark price for symbol ${symbol}`);
             }
-    
+
             // Parse and return the mark price as a float
             const markPrice = parseFloat(symbolData.markPrice);
             return markPrice;
@@ -324,23 +794,23 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
 
     const calculatePositionSize = () => {
         let positionSize = math.bignumber(basePositionSize); // Start with the base position size
-
+    
         // Martingale logic: Double the position size after each loss
         if (math.larger(consecutiveLosses, 0)) {
             positionSize = math.multiply(positionSize, math.pow(2, math.number(consecutiveLosses)));
         }
-
+    
         // Reset position size to base after a win
         if (math.larger(consecutiveWins, 0)) {
             positionSize = math.bignumber(basePositionSize);
         }
-
+    
         // Adjust position size based on drawdown
-        const currentDrawdown = math.subtract(1, math.divide(capital, highWaterMark));
-        if (math.larger(currentDrawdown, 0.05)) {
-            positionSize = math.multiply(positionSize, math.bignumber(0.75)); // Reduce size if drawdown > 5%
-        }
-
+        // const currentDrawdown = math.subtract(1, math.divide(capital, highWaterMark));
+        // if (math.larger(currentDrawdown, 0.05)) {
+        //     positionSize = math.multiply(positionSize, math.bignumber(0.75)); // Reduce size if drawdown > 5%
+        // }
+    
         // Enforce position size limits (min/max)
         return math.max(math.min(positionSize, maxPositionSize), minPositionSize);
     };
@@ -355,15 +825,6 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
     // Current mode (can switch dynamically)
     let currentMode = MODES.MARTINGALE;
 
-    async function getBinanceServerTime() {
-        try {
-            const serverTime = await binance.futuresTime();
-            return serverTime?.serverTime;
-        } catch (error) {
-            console.error('Error fetching Binance server time:', error);
-            throw error;
-        }
-    }
 
     const monitorOpenPositions = async () => {
         try {
@@ -381,15 +842,15 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
             // Filter active positions with non-zero quantity
             const activePositions = openPositions.filter(pos => parseFloat(pos.positionAmt) !== 0);
 
-
-
             for (const position of activePositions) {
                 console.log(`Monitoring active position for ${position.symbol}...`);
 
                 let positionClosed = false;
+                let trailingStopPrice = null; // Initialize trailing stop price
+
                 while (!positionClosed) {
                     // Fetch current market direction
-                    const currentTradeDirection = await decideTradeDirection();
+                    const currentTradeDirection = await decideTradeDirection(positionClosed);
                     const markPrice = await fetchMarkPrice(); // Example current price
 
                     // Fetch updated positions and balance with correct timestamp and recvWindow
@@ -400,7 +861,6 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
 
                     if (updatedPositions.code) {
                         console.error(`Error fetching positions risk: ${updatedPositions.msg}`);
-                        await new Promise(resolve => setTimeout(resolve, 1000));
                         continue;
                     }
 
@@ -411,112 +871,70 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
                         positionClosed = true;
                         sound.play("/Users/_bran/Documents/Trading/coin-flip-88793.mp3");
 
-                        // Update capital and fees
-                        const newCapital = parseFloat(balance.find(asset => asset.asset === 'USDT').balance);
-                        const profitLoss = math.subtract(math.bignumber(newCapital), previousCapital);
-                        capital = newCapital;
+                        // Fetch trade history for the closed position
+                        const tradeHistory = await fetchTradeHistory(symbol, position.orderId);
 
-                        const entryFeeAmount = math.multiply(previousCapital, 0.00018);
-                        const exitFeeAmount = math.multiply(math.abs(profitLoss), 0.00045);
-                        totalFees = math.add(totalFees, math.add(entryFeeAmount, exitFeeAmount));
-                        capital = math.subtract(math.add(capital, profitLoss), math.add(entryFeeAmount, exitFeeAmount));
+                        if (tradeHistory && tradeHistory.length > 0) {
+                            // Calculate total PnL, fees, and other metrics
+                            let totalPnL = 0;
+                            let totalFees = 0;
+                            let totalQuantity = 0;
+                            let totalCost = 0;
 
-                        // Determine if the trade was a win or loss
-                        const isWin = math.larger(profitLoss, 0);
+                            tradeHistory.forEach(trade => {
+                                totalPnL += parseFloat(trade.realizedPnl);
+                                totalFees += parseFloat(trade.commission);
+                                totalQuantity += parseFloat(trade.qty);
+                                totalCost += parseFloat(trade.qty) * parseFloat(trade.price);
+                            });
 
-                        // Update win/loss counters and trend strength
-                        if (isWin) {
-                            consecutiveWins = math.add(consecutiveWins, 1);
-                            consecutiveLosses = math.bignumber(0);
-                            profitableTrades++;
-                            trendStrength = math.min(math.add(trendStrength, 1), math.bignumber(5)); // Increase trend strength on win
+                            const avgEntryPrice = totalCost / totalQuantity;
+
+                            // Update capital
+                            const newCapital = parseFloat(balance.find(asset => asset.asset === 'USDT').balance);
+                            capital = newCapital;
+
+                            // Determine if the trade was a win or loss
+                            const isWin = totalPnL > 0;
+
+                            // Update win/loss counters and trend strength
+                            if (isWin) {
+                                consecutiveWins = math.add(consecutiveWins, 1);
+                                consecutiveLosses = math.bignumber(0);
+                                profitableTrades++;
+                                trendStrength = math.min(math.add(trendStrength, 1), math.bignumber(5)); // Increase trend strength on win
+                            } else {
+                                consecutiveLosses = math.add(consecutiveLosses, 1);
+                                consecutiveWins = math.bignumber(0);
+                                trendStrength = math.max(math.subtract(trendStrength, 1), math.bignumber(-5)); // Decrease trend strength on loss
+                            }
+
+                            // Update high water mark
+                            if (math.larger(capital, highWaterMark)) {
+                                highWaterMark = capital;
+                            }
+
+                            // Log trade details
+                            trades.push({
+                                index: totalTrades,
+                                side: currentTradeDirection?.toLowerCase(),
+                                symbol: symbol,
+                                leverage: `x${leverage}`,
+                                balance: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)}`,
+                                balanceChange: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)} (${math.larger(capital, previousCapital) ? '+' : ''}${(math.number(math.subtract(capital, previousCapital)) / math.number(previousCapital) * 100).toFixed(2)}%)`,
+                                fees: `$ ${math.number(totalFees).toFixed(3)}`,
+                                rawPnl: math.number(totalPnL).toFixed(4),
+                                tradeSize: math.number(totalQuantity),
+                                entryPrice: math.number(avgEntryPrice).toFixed(7),
+                                avgClosePrice: math.number(markPrice).toFixed(7),
+                                markPrice: math.number(markPrice),
+                                liqPrice: math.number(markPrice * (1 - (1 / leverage))).toFixed(4),
+                                exposedAmount: `$ ${math.number(totalCost).toFixed(2)} (${(math.number(totalQuantity) * 100).toFixed(2)}% balance $ ${math.number(previousCapital).toFixed(2)})`,
+                            });
+
+                            console.log(chalkTable(tableOptions, trades));
                         } else {
-                            consecutiveLosses = math.add(consecutiveLosses, 1);
-                            consecutiveWins = math.bignumber(0);
-                            trendStrength = math.max(math.subtract(trendStrength, 1), math.bignumber(-5)); // Decrease trend strength on loss
-                        }
-
-                        // Update high water mark
-                        if (math.larger(capital, highWaterMark)) {
-                            highWaterMark = capital;
-                        }
-
-                        // Log trade details and other updates...
-
-                        //Define positionSize based on the absolute value of the position amount
-                        const positionSize = math.abs(parseFloat(position.positionAmt)); // Calculate the size of the position
-                        let exposedAmount = math.multiply(capital, positionSize);
-                        let leveragedAmount = math.multiply(exposedAmount, leverageBN); // Leveraged exposure
-
-                        // Calculate exposure and fees
-                        let notionalSize = math.multiply(capital, math.multiply(positionSize, leverage));
-
-
-                        // Determine if the closed position was long or short
-                        const wasLong = parseFloat(position.positionAmt) > 0; // Check if the position was long
-
-                        // Update long/short trade tracking
-                        if (wasLong) {
-                            totalLongs++;
-                            totalLongsPnl = math.add(totalLongsPnl, profitLoss);
-                            totalLongsSize = math.add(totalLongsSize, positionSize);
-                            totalLongsFees = math.add(totalLongsFees, math.add(entryFeeAmount, exitFeeAmount));
-                            totalLongsNotionalSize = math.add(totalLongsNotionalSize, leveragedAmount);
-                            totalLongsMargin = math.add(totalLongsMargin, exposedAmount);
-                            totalLongsMarginRatio = math.add(totalLongsMarginRatio, math.divide(exposedAmount, capital));
-                            totalLongsPnlROI = math.add(totalLongsPnlROI, math.divide(profitLoss, exposedAmount));
-                        } else {
-                            totalShorts++;
-                            totalShortsPnl = math.add(totalShortsPnl, profitLoss);
-                            totalShortsSize = math.add(totalShortsSize, positionSize);
-                            totalShortsFees = math.add(totalShortsFees, math.add(entryFeeAmount, exitFeeAmount));
-                            totalShortsNotionalSize = math.add(totalShortsNotionalSize, leveragedAmount);
-                            totalShortsMargin = math.add(totalShortsMargin, exposedAmount);
-                            totalShortsMarginRatio = math.add(totalShortsMarginRatio, math.divide(exposedAmount, capital));
-                            totalShortsPnlROI = math.add(totalShortsPnlROI, math.divide(profitLoss, exposedAmount));
-                        }
-
-                        // Update total PnL and fees
-                        totalPnL = math.add(totalPnL, profitLoss);
-                        totalFeesCombined = math.add(totalFeesCombined, math.add(entryFeeAmount, exitFeeAmount));
-
-                        // Log trade details
-                        trades.push({
-                            index: totalTrades,
-                            side: currentTradeDirection?.toLowerCase(),
-                            symbol: "DEGOUSDT", // Example symbol
-                            leverage: `x${leverage}`,
-                            balance: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)}`,
-                            balanceChange: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)} (${math.larger(capital, previousCapital) ? '+' : ''}${(math.number(math.subtract(capital, previousCapital)) / math.number(previousCapital) * 100).toFixed(2)}%)`,
-                            fees: `$ ${math.number(math.add(entryFeeAmount, exitFeeAmount)).toFixed(3)}`,
-                            entryFee: math.number(entryFeeAmount),
-                            exitFee: math.number(exitFeeAmount),
-                            rawPnl: math.number(profitLoss).toFixed(4),
-                            tradeSize: math.number(positionSize),
-                            size: `${math.round(notionalSize / markPrice) > 0 ? math.round(notionalSize / markPrice) : 1} contracts`, // Use notionalSize for contract size
-                            notionalSize: `${math.number(notionalSize).toFixed(3)}`, // Use notionalSize here
-                            margin: math.number(exposedAmount).toFixed(3),
-                            marginRatio: math.number(math.multiply(math.divide(exposedAmount, capital), 100)).toFixed(3),
-                            pnlROI: math.number(math.multiply(math.divide(profitLoss, exposedAmount), 100)).toFixed(4),
-                            // entryPrice: math.number(entryPrice),
-                            // breakEvenPrice: math.number(entryPrice), // Simplified break-even price
-                            markPrice: math.number(markPrice),
-                            liqPrice: math.number(markPrice * (1 - (1 / leverage))).toFixed(4), // Simplified liquidation price
-                            // tpSlInfo: `TP: $ ${math.number(tpPrice).toFixed(2)}, SL: $ ${math.number(slPrice).toFixed(2)}`,
-                            exposedAmount: `$ ${math.number(exposedAmount).toFixed(2)} (${(math.number(positionSize) * 100).toFixed(2)}% balance $ ${math.number(previousCapital).toFixed(2)})`,
-                        });
-
-                        console.log(chalkTable(tableOptions, trades))
-
-                        // Check for excessive drawdown (stop if max drawdown exceeded)
-                        const drawdown = math.subtract(1, math.divide(capital, highWaterMark));
-                        if (math.larger(drawdown, maxDrawdown) || math.smaller(capital, 0)) {
-                            console.log(chalk.red("\nMax drawdown exceeded or allocated capital depleted. Stopping simulation."));
-                            console.log(chalk.gray(`Current Capital: `) + chalk.red(currencyFormatterUSD(math.number(capital))));
-                            console.log(chalk.gray(`High Water Mark: `) + chalk.green(currencyFormatterUSD(math.number(highWaterMark))));
-                            console.log(chalk.gray(`Drawdown: `) + chalk.red(`${math.number(math.multiply(drawdown, 100)).toFixed(2)}%`));
-                            console.log(chalk.gray(`Max Drawdown Allowed: `) + chalk.red(`${math.number(math.multiply(maxDrawdown, 100)).toFixed(2)}%\n`));
-                            return false; // Stop Trading
+                            console.error('No trade history found for the closed position.');
                         }
 
                         return true; // Keep trading
@@ -531,55 +949,100 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
                     // Opposite action: SELL for long, BUY for short
                     const oppositeAction = isShort ? 'BUY' : 'SELL';
 
+                    // Calculate trailing stop price
+                    const trailingStopDistance = 0.01; // 1% trailing stop distance (adjust as needed)
+                    const newTrailingStopPrice = isShort
+                        ? markPrice * (1 + trailingStopDistance) // For short positions, trail above the mark price
+                        : markPrice * (1 - trailingStopDistance); // For long positions, trail below the mark price
+                    // const tickSize = await fetchTickSize(symbol);
+                    const { tickSize, lotSize } = await fetchSymbolPrecision(symbol);
+
+                    const roundPrice = (price) => roundToPrecision(price, tickSize);
+                    const roundQuantity = (quantity) => roundToPrecision(quantity, lotSize);
+
+                    // Update trailing stop price if the market moves in a favorable direction
+                    // if (!trailingStopPrice || (isShort && newTrailingStopPrice < trailingStopPrice) || (!isShort && newTrailingStopPrice > trailingStopPrice)) {
+                    //     trailingStopPrice = newTrailingStopPrice;
+
+                    //     // Cancel the existing stop-loss order
+                    //     var cancelRes = await binance.futuresCancel(symbol,{ orderId: currentPosition.stopLossOrderId });
+
+
+
+                    //     // / Round price and quantity to the correct precision
+
+
+                    //     // Place a new stop-loss order with the updated trailing stop price
+                    //     const stopLossOrder = {
+                    //         symbol,
+                    //         side: oppositeAction,
+                    //         type: "STOP_MARKET",
+                    //         quantity: roundQuantity(math.number(math.abs(parseFloat(currentPosition.positionAmt)))).toString(),
+                    //         stopPrice: roundPrice(trailingStopPrice).toString(),
+                    //     };
+
+                    //     const [stopLossResponse] = await binance.futuresMultipleOrders([stopLossOrder]);
+
+                    //     if (stopLossResponse.code) {
+                    //         console.error(`Error updating stop-loss order: ${stopLossResponse.msg}`);
+                    //     } else {
+                    //         console.log(`Stop-loss order updated successfully:`, {
+                    //             orderId: stopLossResponse.orderId,
+                    //             symbol: stopLossResponse.symbol,
+                    //             stopPrice: stopLossResponse.stopPrice,
+                    //         });
+                    //     }
+                    // }
+
                     // Log if market direction changes
-                    if (currentTradeDirection && positionDirection?.toLowerCase() !== currentTradeDirection?.toLowerCase()) {
-                        console.log(`Market direction changed from ${positionDirection.toUpperCase()} to ${currentTradeDirection}.`);
-                        sound.play("/Users/_bran/Documents/Trading/e-piano-key-note-f_95bpm_F_minor.wav");
+                    // if (currentTradeDirection && positionDirection?.toLowerCase() !== currentTradeDirection?.toLowerCase()) {
+                    //     console.log(`Market direction changed from ${positionDirection.toUpperCase()} to ${currentTradeDirection}.`);
+                    //     sound.play("/Users/_bran/Documents/Trading/e-piano-key-note-f_95bpm_F_minor.wav");
 
-                        // Prepare orders to close the position
-                        const closeOrders = [
-                            {
-                                symbol,
-                                side: oppositeAction, // Opposite of the current position's direction
-                                type: "MARKET",
-                                quantity: math.number(math.abs(parseFloat(currentPosition.positionAmt))).toString(), // Use the absolute value of positionAmt
-                            },
-                        ];
+                    //     // Prepare orders to close the position
+                    //     const closeOrders = [
+                    //         {
+                    //             symbol,
+                    //             side: oppositeAction, // Opposite of the current position's direction
+                    //             type: "MARKET",
+                    //             quantity: roundQuantity(math.number(math.abs(parseFloat(currentPosition.positionAmt)))).toString(), // Use the absolute value of positionAmt
+                    //         },
+                    //     ];
 
-                        // Execute the close orders
-                        const closeResponse = await binance.futuresMultipleOrders(closeOrders);
+                    //     // Execute the close orders
+                    //     const closeResponse = await binance.futuresMultipleOrders(closeOrders);
 
-                        let allCloseOrdersSuccessful = true;
+                    //     let allCloseOrdersSuccessful = true;
 
-                        closeResponse.forEach((order, index) => {
-                            if (order.code) {
-                                // Handle failed orders
-                                console.error(`Error in closing order ${index + 1}: ${order.msg}`);
-                                allCloseOrdersSuccessful = false; // Flag error
-                            } else {
-                                // Handle successful orders
-                                console.log(`Closing order ${index + 1} placed successfully:`, {
-                                    orderId: order.orderId,
-                                    symbol: order.symbol,
-                                    status: order.status,
-                                    side: order.side,
-                                    type: order.type,
-                                    quantity: order.origQty,
-                                    price: order.price,
-                                    time: new Date(order.updateTime).toLocaleString(),
-                                });
-                            }
-                        });
+                    //     closeResponse.forEach((order, index) => {
+                    //         if (order.code) {
+                    //             // Handle failed orders
+                    //             console.error(`Error in closing order ${index + 1}: ${order.msg}`);
+                    //             allCloseOrdersSuccessful = false; // Flag error
+                    //         } else {
+                    //             // Handle successful orders
+                    //             console.log(`Closing order ${index + 1} placed successfully:`, {
+                    //                 orderId: order.orderId,
+                    //                 symbol: order.symbol,
+                    //                 status: order.status,
+                    //                 side: order.side,
+                    //                 type: order.type,
+                    //                 quantity: order.origQty,
+                    //                 price: order.price,
+                    //                 time: new Date(order.updateTime).toLocaleString(),
+                    //             });
+                    //         }
+                    //     });
 
-                        if (allCloseOrdersSuccessful) {
-                            sound.play("/Users/_bran/Documents/Trading/effect_notify-84408.mp3");
-                            console.log("Position closed successfully.");
-                            positionClosed = true; // Set positionClosed to true to exit the loop
-                            return true; // Signal that the position is closed
-                        } else {
-                            console.error("Failed to close the position.");
-                        }
-                    }
+                    //     if (allCloseOrdersSuccessful) {
+                    //         sound.play("/Users/_bran/Documents/Trading/effect_notify-84408.mp3");
+                    //         console.log("Position closed successfully.");
+                    //         positionClosed = true; // Set positionClosed to true to exit the loop
+                    //         return true; // Signal that the position is closed
+                    //     } else {
+                    //         console.error("Failed to close the position.");
+                    //     }
+                    // }
 
                     // Update previous direction
                     previousDirection = currentTradeDirection;
@@ -677,16 +1140,42 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
             let tpPrice, slPrice;
 
             // Set markPrice and calculate TP and SL based on the trade direction
-            const desiredWinPnL = 0.40; // 30% profit on capital
-            const desiredLossPnL = 0.10; // 10% loss on capital
+            const desiredWinPnL = 1.00; // 100% profit on capital
+            const desiredLossPnL = 1.00; // 100% loss on capital
+            const ATRMultiplier = 0.3; // Multiplier for ATR-based SL (adjust based on risk tolerance)
+
+            const [{ input: input1m }, { input: input3m }] = await Promise.all([
+                fetchOHLCVWithRetry(exchange, symbol, '1m'), // 1-minute data with retry
+                fetchOHLCVWithRetry(exchange, symbol, '3m')  // 3-minute data with retry
+            ]);
+
+            const [atr1m] = await Promise.all([
+                atr(5, input1m), // 1-minute ATR
+            ]);
+
+            // Fetch the latest ATR value (from 1-minute or 3-minute timeframe)
+            const atrValue = atr1m[atr1m.length - 1]; // Use the latest 1-minute ATR value
 
             if (goLong) {
-                tpPrice = markPrice * (1 + (desiredWinPnL / leverage)); // TP for long (30% win)
+                tpPrice = markPrice * (1 + (desiredWinPnL / leverage)); // TP for long (25% win)
                 slPrice = markPrice * (1 - (desiredLossPnL / leverage)); // SL for long (10% loss)
             } else {
-                tpPrice = markPrice * (1 - (desiredWinPnL / leverage)); // TP for short (30% win)
+                tpPrice = markPrice * (1 - (desiredWinPnL / leverage)); // TP for short (25% win)
                 slPrice = markPrice * (1 + (desiredLossPnL / leverage)); // SL for short (10% loss)
             }
+
+            // Optional: Use ATR-based SL as an alternative or additional condition
+            // if (goLong) {
+            //     slPrice = Math.min(slPrice, markPrice - (atrValue * ATRMultiplier)); // Use the tighter SL
+            // } else {
+            //     slPrice = Math.max(slPrice, markPrice + (atrValue * ATRMultiplier)); // Use the tighter SL
+            // }
+
+            console.log(`Trade Direction: ${goLong ? 'LONG' : 'SHORT'}`);
+            console.log(`Entry Price: ${markPrice}`);
+            console.log(`Take Profit: ${tpPrice}`);
+            console.log(`Stop Loss: ${slPrice}`);
+            console.log(`ATR Value: ${atrValue}`);
 
             // Calculate position size based on the current mode
             let positionSize = calculatePositionSize();
@@ -725,7 +1214,7 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
             const orders = [
                 { symbol, side: action, type: "MARKET", quantity: roundQuantity(math.number(notionalSize)).toString() },
                 { symbol, side: oppositeAction, type: "LIMIT", quantity: roundQuantity(math.number(notionalSize)).toString(), price: roundPrice(tpPrice).toString(), timeInForce: "GTC" },
-                { symbol, side: oppositeAction, type: "STOP_MARKET", quantity: roundQuantity(math.number(notionalSize)).toString(), stopPrice: roundPrice(slPrice).toString() }
+                { sym?bol, side: oppositeAction, type: "STOP_MARKET", quantity: roundQuantity(math.number(notionalSize)).toString(), stopPrice: roundPrice(slPrice).toString() }
             ];
 
             const response = await binance.futuresMultipleOrders(orders);
@@ -754,14 +1243,15 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
 
             sound.play("/Users/_bran/Documents/Trading/effect_notify-84408.mp3");
 
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            // await new Promise(resolve => setTimeout(resolve, 2000));
 
             // Monitor the position until it's closed
             let positionClosed = false;
             while (!positionClosed) {
                 positionClosed = await monitorOpenPositions();
                 if (!positionClosed) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    console.error(`Position has been closed, no onger monitoring`);
+                    // await new Promise(resolve => setTimeout(resolve, 1000));
                 }
             }
 
@@ -774,7 +1264,7 @@ const simulateTradesWithRiskManagement = async (startingCapital, winrate, target
     };
 
     // Main trading loop
-    const cooldownDuration = 1 * 60 * 1000; // 1 minute in milliseconds
+    const cooldownDuration = .1 * 60 * 1000; // 1 minute in milliseconds
 
     const runTradingLoop = async () => {
         while (true) {
@@ -969,7 +1459,7 @@ async function runSimulationInStages(startingCapital, targetGoal, winrate, lever
 }
 
 // Example usage
-const innitialStartingCapital = 0.2; // Initial capital in USDT
-const targetGoal = math.bignumber(100.00); // Final goal in USDT
+const innitialStartingCapital = 1; // Initial capital in USDT
+const targetGoal = math.bignumber(10.00); // Final goal in USDT
 
 runSimulationInStages(innitialStartingCapital, targetGoal, winrate, leverage);

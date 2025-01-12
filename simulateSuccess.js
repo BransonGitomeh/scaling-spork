@@ -2,19 +2,33 @@ const Binance = require('node-binance-api');
 const currency = require('currency.js');
 const math = require('mathjs');
 const moment = require('moment');
-require('moment-duration-format');
 const chalk = require('chalk');
 const chalkTable = require('chalk-table');
-require("dotenv").config();
+require('dotenv').config();
 
-// Constants
-const winrate = 0.5; // 70% winrate
-const leverage = 75; // 100x leverage
-let minNotional = 5.1
+// Enhanced Constants
+const INITIAL_POSITION_SIZE = math.bignumber(0.02);    // Start with 2% position size
+const MAX_POSITION_SIZE = math.bignumber(0.30);        // Cap at 30% position size
+const MIN_NOTIONAL = math.bignumber(5.1);              // Minimum trade size
+const BASE_LEVERAGE = 75;                              // Base leverage
+const MAX_RETRY_MULTIPLIER = 2;                        // Maximum position multiplier for retries
+const SAVINGS_RATE = math.bignumber(0.50);             // Save 50% of profits
+const MAX_DRAWDOWN = 2.00;                             // 200% max drawdown
+const STAGE_GROWTH_MULTIPLIER = 15;                    // More conservative stage targets
+
+// Trading pair setup
 let symbol = "DEGOUSDT";
+let markPrice = math.bignumber(3); // Example fixed price for simulation
 
-const currencyFormatterUSD = (amount = 0) => currency(amount.toFixed(2), { symbol: '$ ', separator: ',', decimal: '.', precision: 2 }).format();
+// Formatting helpers
+const currencyFormatterUSD = (amount = 0) => currency(amount.toFixed(2), {
+    symbol: '$ ',
+    separator: ',',
+    decimal: '.',
+    precision: 2
+}).format();
 
+// Enhanced table options for better visualization
 const tableOptions = {
     leftPad: 2,
     style: {
@@ -23,410 +37,409 @@ const tableOptions = {
         compact: true
     },
     columns: [
-        // Only include the specified fields
-        { field: "size", name: chalk.yellow("Size") }, // Size
-        { field: "notionalSize", name: chalk.green("Notional Size") }, // Notional Size
-        { field: "exposedAmount", name: chalk.green("Exposed Amount") },
-        { field: "leverage", name: chalk.green("leverage") }, // Notional Size
-        { field: "entryPrice", name: chalk.blue("Entry Price") }, // Entry Price
-        { field: "breakEvenPrice", name: chalk.cyan("Break Even Price") }, // Break Even Price
-        { field: "markPrice", name: chalk.green("Mark Price") }, // Mark Price
-        { field: "liqPrice", name: chalk.magenta("Liq. Price") }, // Liquidation Price
-        { field: "marginRatio", name: chalk.yellow("Margin Ratio") }, // Margin Ratio
-        { field: "margin", name: chalk.green("Margin") }, // Margin (Exposed Amount)
-        { field: "rawPnl", name: chalk.green("PNL") }, // PNL as ROI
-        { field: "pnlROI", name: chalk.green("PNL ROI %") }, // PNL as ROI
-        { field: "tpSlInfo", name: chalk.blue("TP/SL") }, // TP/SL for entire position
-        { field: "balanceChange", name: chalk.blue("Balance Effect") }, // TP/SL for entire position,
-        { field: "fees", name: chalk.blue("Fee Costs") }, // TP/SL for entire position
-
-    ],
+        { field: "stage", name: chalk.yellow("Stage") },
+        { field: "attempt", name: chalk.yellow("Attempt") },
+        { field: "size", name: chalk.yellow("Size") },
+        { field: "notionalSize", name: chalk.green("Notional Size") },
+        { field: "positionSize", name: chalk.green("Position") },
+        { field: "positionSizePercent", name: chalk.green("Position %") },
+        { field: "exposedAmount", name: chalk.green("Exposed $") },
+        { field: "effectiveLeverage", name: chalk.blue("Leverage") },
+        { field: "entryPrice", name: chalk.blue("Entry") },
+        { field: "markPrice", name: chalk.green("Mark") },
+        { field: "liqPrice", name: chalk.magenta("Liq.") },
+        { field: "drawdown", name: chalk.red("Drawdown %") },
+        { field: "pnl", name: chalk.green("PnL") },
+        { field: "pnlPercent", name: chalk.green("PnL %") },
+        { field: "balance", name: chalk.blue("Balance") },
+        { field: "savings", name: chalk.cyan("Savings") }
+    ]
 };
 
-// Initialize aggregates for longs and shorts
-// Long and short trade tracking
-let totalLongs = 0;
-let totalShorts = 0;
-let totalLongsPnl = math.bignumber(0);
-let totalShortsPnl = math.bignumber(0);
-let totalLongsSize = math.bignumber(0);
-let totalShortsSize = math.bignumber(0);
-let totalLongsFees = math.bignumber(0);
-let totalShortsFees = math.bignumber(0);
-let totalLongsNotionalSize = math.bignumber(0);
-let totalShortsNotionalSize = math.bignumber(0);
-let totalLongsMargin = math.bignumber(0);
-let totalShortsMargin = math.bignumber(0);
-let totalLongsMarginRatio = math.bignumber(0);
-let totalShortsMarginRatio = math.bignumber(0);
-let totalLongsPnlROI = math.bignumber(0);
-let totalShortsPnlROI = math.bignumber(0);
+const calculatePositionSize = (state, mode = "martingale") => {
+    const { capital, consecutiveLosses, previousPositionSize, consecutiveWins } = state;
 
-// Total PnL and Fees
-let totalPnL = math.bignumber(0);
-let totalFeesCombined = math.bignumber(0);
+    // Base position size
+    let positionSize = previousPositionSize || INITIAL_POSITION_SIZE;
 
-const simulateTradesWithRiskManagement = async (startingCapital, winrate, targetCapital, leverage) => {
-    // Input validation
-    if (!startingCapital || startingCapital <= 0) {
-        console.log(chalk.red("Liquidation occurred: Capital is depleted."));
-        throw new Error('Invalid starting capital');
+    switch (mode) {
+        case "martingale":
+            if (math.larger(consecutiveLosses, 0)) {
+                const retryMultiplier = math.add(math.number(consecutiveLosses), 1);
+                positionSize = math.multiply(INITIAL_POSITION_SIZE, retryMultiplier);
+            }
+            break;
+
+        case "antiMartingale":
+            if (math.larger(consecutiveWins, 0)) {
+                const growthMultiplier = math.min(
+                    1 + (math.number(consecutiveWins) * 0.5),
+                    MAX_RETRY_MULTIPLIER
+                );
+                positionSize = math.multiply(positionSize, growthMultiplier);
+            } else {
+                positionSize = INITIAL_POSITION_SIZE;
+            }
+            break;
+
+        case "customMartingale":
+            if (math.larger(consecutiveLosses, 0)) {
+                const retryMultiplier = math.min(
+                    1 + (math.number(consecutiveLosses) * 0.5),
+                    MAX_RETRY_MULTIPLIER
+                );
+                positionSize = math.multiply(positionSize, retryMultiplier);
+
+                state.effectiveLeverage = math.min(
+                    BASE_LEVERAGE + (math.number(consecutiveLosses) * 5),
+                    MAX_RETRY_MULTIPLIER * BASE_LEVERAGE
+                );
+            }
+            break;
+
+        default:
+            throw new Error("Invalid trading mode");
     }
-    if (!winrate || winrate <= 0 || winrate > 1) {
-        throw new Error('Invalid winrate. Winrate must be between 0 and 1.');
+
+    // Ensure position size does not exceed the maximum allowed
+    positionSize = math.min(positionSize, MAX_POSITION_SIZE);
+
+    // Calculate notional size (total value of the position)
+    let notionalSize = math.multiply(math.multiply(capital, positionSize), markPrice);
+
+    // Apply leverage to the notional size
+    let leveragedNotionalSize = math.multiply(notionalSize, BASE_LEVERAGE);
+
+    // Adjust position size if leveraged notional size is below the minimum notional requirement
+    if (math.smaller(leveragedNotionalSize, MIN_NOTIONAL)) {
+        // Recalculate position size to meet the minimum notional requirement
+        positionSize = math.divide(MIN_NOTIONAL, math.multiply(math.multiply(capital, markPrice), BASE_LEVERAGE));
+
+        // Recalculate notional size and leveraged notional size with the updated position size
+        notionalSize = math.multiply(math.multiply(capital, positionSize), markPrice);
+        leveragedNotionalSize = math.multiply(notionalSize, BASE_LEVERAGE);
     }
-    if (!targetCapital || targetCapital <= 0) {
-        throw new Error('Invalid target capital. Target capital must be greater than 0.');
+
+    // Ensure position size does not exceed available capital
+    if (math.larger(math.multiply(capital, positionSize), capital)) {
+        // Recalculate position size to fit available capital
+        positionSize = math.divide(capital, math.multiply(capital, markPrice));
+
+        // Recalculate notional size and leveraged notional size with the updated position size
+        notionalSize = math.multiply(math.multiply(capital, positionSize), markPrice);
+        leveragedNotionalSize = math.multiply(notionalSize, BASE_LEVERAGE);
     }
-    if (!leverage || leverage <= 0) {
-        throw new Error('Invalid leverage. Leverage must be greater than 0.');
+
+    return {
+        positionSize,
+        notionalSize: leveragedNotionalSize
+    };
+};
+
+const STOP_LOSS_PERCENT = 0.01; // 1% stop-loss
+const TAKE_PROFIT_PERCENT = 0.01; // 1% take-profit
+
+const executeTrade = (state, mode = "martingale") => {
+    const { positionSize, notionalSize } = calculatePositionSize(state, mode);
+    const exposedAmount = math.multiply(state.capital, positionSize);
+
+    let effectiveLeverage = BASE_LEVERAGE;
+    if (mode === "customMartingale") {
+        effectiveLeverage = state.effectiveLeverage || BASE_LEVERAGE;
     }
 
-    // Convert all initial inputs to BigNumber
-    const capitalBN = math.bignumber(startingCapital);
-    const targetCapitalBN = math.bignumber(targetCapital);
-    const leverageBN = math.bignumber(leverage);
-    const winrateBN = math.bignumber(winrate);
+    // Calculate TP and SL prices
+    const entryPrice = math.number(markPrice);
+    const tpPrice = entryPrice * (1 + TAKE_PROFIT_PERCENT);
+    const slPrice = entryPrice * (1 - STOP_LOSS_PERCENT);
 
-    // Initialize core variables with BigNumber precision
-    let capital = capitalBN;
-    let previousCapital = capitalBN;
-    let trades = [];
-    let consecutiveWins = math.bignumber(0);
-    let consecutiveLosses = math.bignumber(0);
+    // Simulate price movement (randomly decide if it hits TP or SL)
+    const isWin = Math.random() < 0.5;
+    const exitPrice = isWin ? tpPrice : slPrice;
 
-    // Enhanced risk management parameters
-    const maxDrawdown = math.bignumber(0.20); // 10% max drawdown (more conservative)
-    const basePositionSize = math.bignumber(0.30); // Base position size (2% of capital)
-    const maxPositionSize = math.bignumber(0.30); // Max position size (5% of capital)
-    const minPositionSize = math.bignumber(0.01); // Min position size (1% of capital)
-    // const minNotional = math.bignumber(10); // Minimum notional size of $10
+    // Calculate PnL based on exit price
+    const priceChange = (exitPrice - entryPrice) / entryPrice;
+    const profitLoss = math.multiply(notionalSize, math.bignumber(priceChange));
 
-    // Fee structure (entry and exit fees)
-    const entryFee = math.bignumber(0.001); // 0.1% entry fee
-    const exitFee = math.bignumber(0.001); // 0.1% exit fee
+    // Deduct fees
+    const fees = math.multiply(exposedAmount, 0.002);
+    const newCapital = math.subtract(math.add(state.capital, profitLoss), fees);
+    const isCapitalDepleted = math.smallerEq(newCapital, 0);
 
-    // Performance tracking variables
-    let highWaterMark = capital;
-    let totalFees = math.bignumber(0);
-    let totalTrades = 0;
-    let profitableTrades = 0;
-    let trendStrength = math.bignumber(0); // Trend strength for win rate adjustment
+    // Update consecutive wins/losses
+    if (isWin) {
+        state.consecutiveWins = math.add(state.consecutiveWins || math.bignumber(0), math.bignumber(1));
+        state.consecutiveLosses = math.bignumber(0);
+    } else {
+        state.consecutiveLosses = math.add(state.consecutiveLosses || math.bignumber(0), math.bignumber(1));
+        state.consecutiveWins = math.bignumber(0);
+    }
 
-    const calculatePositionSize = () => {
-        let positionSize = math.bignumber(basePositionSize); // Start with the base position size
+    // Martingale adjustment: Double the position size after a loss
+    if (mode === "martingale" && !isWin) {
+        state.positionSize = math.multiply(state.positionSize || math.bignumber(0.01), math.bignumber(2));
+    }
 
-        // Martingale logic: Double the position size after each loss
-        if (math.larger(consecutiveLosses, 0)) {
-            positionSize = math.multiply(positionSize, math.pow(2, math.number(consecutiveLosses)));
-        }
+    // Update high water mark
+    if (math.larger(state.capital, state.highWaterMark)) {
+        state.highWaterMark = state.capital;
+    }
 
-        // Reset position size to base after a win
-        if (math.larger(consecutiveWins, 0)) {
-            positionSize = math.bignumber(basePositionSize);
-        }
+    // Calculate drawdown
+    const drawdown = math.multiply(
+        math.subtract(1, math.divide(state.capital, state.highWaterMark)),
+        100
+    );
 
-        // Adjust position size based on drawdown
-        const currentDrawdown = math.subtract(1, math.divide(capital, highWaterMark));
-        if (math.larger(currentDrawdown, 0.05)) {
-            positionSize = math.multiply(positionSize, math.bignumber(0.75)); // Reduce size if drawdown > 5%
-        }
+    // Calculate initial margin (position size in terms of capital)
+    const initialMargin = math.divide(notionalSize, effectiveLeverage);
 
-        // Enforce position size limits (min/max)
-        return math.max(math.min(positionSize, maxPositionSize), minPositionSize);
+    // Calculate PnL percentage based on initial margin
+    const pnlPercent = math.multiply(
+        math.divide(profitLoss, initialMargin),
+        100
+    );
+
+    const liqPrice = math.multiply(
+        entryPrice,
+        math.subtract(1, math.divide(1, effectiveLeverage))
+    );
+
+    // Create the trade object
+    const trade = {
+        stage: math.number(state.stageCount),
+        attempt: math.number(state.stageRetryCount) + 1,
+        size: `${math.round(math.divide(notionalSize, markPrice))} contracts`,
+        notionalSize: currencyFormatterUSD(math.number(notionalSize)),
+        positionSize: currencyFormatterUSD(math.number(initialMargin)), // Use initial margin as position size
+        positionSizePercent: `${(math.number(positionSize) * 100).toFixed(2)}%`,
+        exposedAmount: currencyFormatterUSD(math.number(exposedAmount)),
+        effectiveLeverage: `${math.round(effectiveLeverage)}x`,
+        entryPrice: entryPrice,
+        markPrice: exitPrice.toFixed(4), // Use exit price as mark price
+        liqPrice,
+        drawdown: math.max(0, math.number(drawdown)).toFixed(2), // Ensure drawdown is not negative
+        pnl: currencyFormatterUSD(math.number(profitLoss)),
+        pnlPercent: `${math.number(pnlPercent).toFixed(2)}%`, // Corrected PnL percentage
+        balance: currencyFormatterUSD(math.number(newCapital)),
+        savings: currencyFormatterUSD(math.number(state.savings))
     };
 
-    // Execute a single trade
-    const executeTrade = () => {
-        totalTrades++;
-        previousCapital = capital;
+    // Update state
+    state.capital = newCapital;
+    state.stageCount = math.add(state.stageCount || math.bignumber(0), math.bignumber(1));
+    if (!isWin) {
+        state.stageRetryCount = math.add(state.stageRetryCount || math.bignumber(0), math.bignumber(1));
+    } else {
+        state.stageRetryCount = math.bignumber(0);
+    }
 
-        // Determine trade direction randomly (long or short)
-        const goLong = Math.random() < 0.5;
-        const tradeDirection = goLong ? "LONG" : "SHORT";
+    return { trade, state, isCapitalDepleted };
+};
 
-        // Set markPrice and calculate TP and SL based on the trade direction
-        const desiredWinPnL = 0.40; // 30% profit on capital
-        const desiredLossPnL = 0.10; // 10% loss on capital
-        const markPrice = 3; // Example current price
-        const entryPrice = 3; // Price at which the trade was entered
+// Enhanced multi-stage trading
+const runMultiStageTrading = async (startingCapital, targetCapital) => {
+    let state = {
+        capital: math.bignumber(startingCapital),
+        consecutiveLosses: math.bignumber(0),
+        consecutiveWins: math.bignumber(0),
+        previousPositionSize: null,
+        stageCount: math.bignumber(1),
+        stageRetryCount: math.bignumber(0),
+        attempts: [], // Tracks all attempts within the current stage
+        stageStartCapital: math.bignumber(startingCapital),
+        highWaterMark: math.bignumber(startingCapital),
+        savings: math.bignumber(0),
+        drawdown: math.bignumber(0),
+        isLiquidated: false
+    };
 
-        // Calculate TP and SL based on the desired PnL and leverage
-        let tpPrice, slPrice;
-        if (goLong) {
-            tpPrice = entryPrice * (1 + (desiredWinPnL / leverage)); // TP for long (30% win)
-            slPrice = entryPrice * (1 - (desiredLossPnL / leverage)); // SL for long (10% loss)
-        } else {
-            tpPrice = entryPrice * (1 - (desiredWinPnL / leverage)); // TP for short (30% win)
-            slPrice = entryPrice * (1 + (desiredLossPnL / leverage)); // SL for short (10% loss)
+    const maxStages = math.bignumber(10000);
+    const maxRetries = math.bignumber(20);
+
+    // Dynamic stage growth multiplier
+    const STAGE_GROWTH_MULTIPLIER_DYNAMIC = math.divide(targetCapital, startingCapital);
+
+    // Array to store all stages and their attempts for logging
+    const simulationLogs = [];
+
+    while (math.smaller(math.add(state.capital, state.savings), targetCapital) && math.smallerEq(state.stageCount, maxStages)) {
+        console.log(chalk.cyan(`\n=== Stage ${math.number(state.stageCount)} ===`));
+        console.log(chalk.yellow(`Starting capital: ${currencyFormatterUSD(math.number(state.capital))}`));
+        console.log(chalk.yellow(`Savings: ${currencyFormatterUSD(math.number(state.savings))}`));
+        console.log(chalk.yellow(`Total: ${currencyFormatterUSD(math.number(math.add(state.capital, state.savings)))}`));
+
+        // Calculate stage target
+        const stageTarget = math.multiply(state.stageStartCapital, STAGE_GROWTH_MULTIPLIER_DYNAMIC);
+        console.log(chalk.yellow(`Target for this stage: ${currencyFormatterUSD(math.number(stageTarget))}`));
+
+        // Reset attempts for the current stage
+        state.attempts = [];
+
+        // Execute multiple attempts within the stage
+        while (math.smaller(state.capital, stageTarget) && math.smallerEq(state.stageRetryCount, maxRetries)) {
+            console.log(chalk.cyan(`\n--- Attempt ${math.number(state.stageRetryCount) + 1} ---`));
+
+            // Reset trades for the current attempt
+            const currentAttempt = {
+                attemptNumber: math.number(state.stageRetryCount) + 1,
+                trades: [], // Initialize as an empty array
+                savings: 0
+            };
+
+            // Execute multiple trades within the attempt
+            while (math.smaller(state.capital, stageTarget) && !state.isLiquidated) {
+                // Execute trade and preserve all state properties
+                const { trade, state: tradeResult } = executeTrade(state);
+                state = {
+                    ...state,
+                    capital: tradeResult.capital,
+                    consecutiveLosses: tradeResult.consecutiveLosses,
+                    consecutiveWins: tradeResult.consecutiveWins,
+                    previousPositionSize: tradeResult.previousPositionSize,
+                    highWaterMark: tradeResult.highWaterMark,
+                    drawdown: tradeResult.drawdown,
+                    isLiquidated: tradeResult.isLiquidated
+                };
+
+                // Add the trade to the current attempt's trades array
+                currentAttempt.trades.push(trade);
+
+                // Check if capital is depleted
+                if (math.smallerEq(state.capital, 0)) {
+                    console.log(chalk.red("\nCapital depleted. Simulation stopped."));
+                    state.isLiquidated = true;
+                    break;
+                }
+            }
+
+            // Add the current attempt to the stage's attempts
+            state.attempts.push(currentAttempt);
+
+            // Check for stage completion or failure
+            if (state.isLiquidated || math.smallerEq(state.capital, 0)) {
+                // Log the trades for the failed attempt
+                console.log(chalk.cyan(`\nTrades for Attempt ${math.number(state.stageRetryCount)}:`));
+                console.log(chalkTable(tableOptions, currentAttempt.trades));
+
+                console.log(chalk.red("\nStage failed:"));
+                console.log(chalk.gray(`Drawdown: ${math.number(state.drawdown).toFixed(2)}%`));
+                console.log(chalk.gray(`Max Allowed: ${MAX_DRAWDOWN * 100}%`));
+                console.log(chalk.gray(`Attempt: ${math.number(state.stageRetryCount) + 1}/${math.number(maxRetries)}`));
+
+                // Log the reason for retry
+                if (math.larger(state.drawdown, MAX_DRAWDOWN * 100)) {
+                    console.log(chalk.red("Reason: Drawdown exceeded maximum allowed."));
+                } else if (math.smallerEq(state.capital, 0)) {
+                    console.log(chalk.red("Reason: Capital depleted."));
+                } else {
+                    console.log(chalk.red("Reason: Trade resulted in a loss."));
+                }
+
+                // Increment retry count on every loop iteration within the same stage
+                state = {
+                    ...state,
+                    stageRetryCount: math.add(state.stageRetryCount, math.bignumber(1)),
+                    capital: state.stageStartCapital,
+                    consecutiveLosses: math.bignumber(0),
+                    consecutiveWins: math.bignumber(0),
+                    previousPositionSize: math.multiply(
+                        state.previousPositionSize || INITIAL_POSITION_SIZE,
+                        math.bignumber(0.50)
+                    ),
+                    isLiquidated: false // Reset liquidation flag for the next attempt
+                };
+
+                // If max retries reached, move to the next stage
+                if (math.largerEq(state.stageRetryCount, maxRetries)) {
+                    console.log(chalk.red(`\nMax retries reached for stage ${math.number(state.stageCount)}. Moving to next stage.`));
+                    state = {
+                        ...state,
+                        stageCount: math.add(state.stageCount, math.bignumber(1)),
+                        stageRetryCount: math.bignumber(0),
+                        stageStartCapital: state.capital
+                    };
+                    break; // Exit the attempts loop and move to the next stage
+                }
+            } else if (math.larger(state.capital, stageTarget)) {
+                // Calculate profits and savings
+                const profits = math.subtract(state.capital, state.stageStartCapital);
+                const savingsAmount = math.multiply(profits, SAVINGS_RATE);
+
+                // Update state with new savings and capital
+                state.savings = math.add(state.savings, savingsAmount);
+                state.capital = math.subtract(state.capital, savingsAmount);
+
+                // Log the trades for the current attempt
+                console.log(chalk.cyan(`\nTrades for Attempt ${math.number(state.stageRetryCount)}:`));
+                console.log(chalkTable(tableOptions, currentAttempt.trades));
+
+                console.log(chalk.green(`\nStage ${math.number(state.stageCount)} completed successfully!`));
+                console.log(chalk.gray("Stage Profit: ") + chalk.green(currencyFormatterUSD(math.number(profits))));
+                console.log(chalk.gray("Savings Added: ") + chalk.green(currencyFormatterUSD(math.number(savingsAmount))));
+
+                // Update state with new savings and capital
+                const newCapital = math.subtract(state.capital, savingsAmount);
+                state = {
+                    ...state,
+                    savings: math.add(state.savings, savingsAmount),
+                    capital: newCapital,
+                    stageCount: math.add(state.stageCount, math.bignumber(1)),
+                    stageRetryCount: math.bignumber(0),
+                    stageStartCapital: newCapital,
+                    consecutiveLosses: math.bignumber(0),
+                    consecutiveWins: math.bignumber(0),
+                    previousPositionSize: INITIAL_POSITION_SIZE // Reset position size
+                };
+
+                // Update the savings in the last trade log
+                if (currentAttempt.trades.length > 0) {
+                    const lastTrade = currentAttempt.trades[currentAttempt.trades.length - 1];
+                    lastTrade.savings = currencyFormatterUSD(math.number(state.savings));
+                } else {
+                    console.warn("No trades found in currentAttempt. Cannot update savings.");
+                }
+
+                break; // Exit the attempts loop and move to the next stage
+            }
         }
 
-        // Calculate position size based on the current mode
-        let positionSize = calculatePositionSize();
-
-        // Calculate exposure and fees
-        let exposedAmount = math.multiply(capital, positionSize);
-        let notionalSize = math.multiply(capital, math.multiply(positionSize, leverage));
-        let leveragedAmount = math.multiply(exposedAmount, leverageBN); // Leveraged exposure
-
-        // Ensure notionalSize meets the minimum notional
-        if (math.smaller(notionalSize, minNotional)) {
-            positionSize = math.divide(minNotional, math.multiply(capital, markPrice)); // Adjust position size
-            exposedAmount = math.multiply(capital, positionSize);
-            notionalSize = math.multiply(exposedAmount, markPrice); // Recalculate notional size
-            leveragedAmount = math.multiply(exposedAmount, leverageBN); // Recalculate leveraged amount
-        }
-
-        // Simulate trade outcome based on win rate
-        const isWin = Math.random() < math.number(winrateBN);
-
-        // Calculate profit/loss and adjust based on win/loss and leverage
-        let profitLoss;
-        if (isWin) {
-            profitLoss = math.multiply(math.bignumber(desiredWinPnL), math.divide(leveragedAmount, leverageBN))            
-            consecutiveWins = math.add(consecutiveWins, 1);
-            consecutiveLosses = math.bignumber(0);
-            profitableTrades++;
-            trendStrength = math.min(math.add(trendStrength, 1), math.bignumber(5)); // Increase trend strength on win
-        } else {
-            profitLoss = math.multiply(math.bignumber(-desiredLossPnL), math.divide(leveragedAmount, leverageBN));            
-            consecutiveLosses = math.add(consecutiveLosses, 1);
-            consecutiveWins = math.bignumber(0);
-            trendStrength = math.max(math.subtract(trendStrength, 1), math.bignumber(-5)); // Decrease trend strength on loss
-        }
-
-        // Apply fees (entry + exit)
-        const entryFeeAmount = math.multiply(exposedAmount, entryFee);
-        const exitFeeAmount = math.multiply(math.abs(profitLoss), exitFee);
-        totalFees = math.add(totalFees, math.add(entryFeeAmount, exitFeeAmount));
-
-        // Update capital after trade result and fees
-        capital = math.subtract(math.add(capital, profitLoss), math.add(entryFeeAmount, exitFeeAmount));
-
-        // Update high water mark (track the highest capital reached)
-        if (math.larger(capital, highWaterMark)) {
-            highWaterMark = capital;
-        }
-
-        // Update long/short trade tracking
-        if (goLong) {
-            totalLongs++;
-            totalLongsPnl = math.add(totalLongsPnl, profitLoss);
-            totalLongsSize = math.add(totalLongsSize, positionSize);
-            totalLongsFees = math.add(totalLongsFees, math.add(entryFeeAmount, exitFeeAmount));
-            totalLongsNotionalSize = math.add(totalLongsNotionalSize, leveragedAmount);
-            totalLongsMargin = math.add(totalLongsMargin, exposedAmount);
-            totalLongsMarginRatio = math.add(totalLongsMarginRatio, math.divide(exposedAmount, capital));
-            totalLongsPnlROI = math.add(totalLongsPnlROI, math.divide(profitLoss, exposedAmount));
-        } else {
-            totalShorts++;
-            totalShortsPnl = math.add(totalShortsPnl, profitLoss);
-            totalShortsSize = math.add(totalShortsSize, positionSize);
-            totalShortsFees = math.add(totalShortsFees, math.add(entryFeeAmount, exitFeeAmount));
-            totalShortsNotionalSize = math.add(totalShortsNotionalSize, leveragedAmount);
-            totalShortsMargin = math.add(totalShortsMargin, exposedAmount);
-            totalShortsMarginRatio = math.add(totalShortsMarginRatio, math.divide(exposedAmount, capital));
-            totalShortsPnlROI = math.add(totalShortsPnlROI, math.divide(profitLoss, exposedAmount));
-        }
-
-        // Update total PnL and fees
-        totalPnL = math.add(totalPnL, profitLoss);
-        totalFeesCombined = math.add(totalFeesCombined, math.add(entryFeeAmount, exitFeeAmount));
-
-        // Log trade details
-        trades.push({
-            index: totalTrades,
-            side: tradeDirection.toLowerCase(),
-            symbol: "DEGOUSDT", // Example symbol
-            leverage: `x${leverage}`,
-            balance: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)}`,
-            balanceChange: `$ ${math.number(previousCapital).toFixed(2)} → $ ${math.number(capital).toFixed(2)} (${math.larger(capital, previousCapital) ? '+' : ''}${(math.number(math.subtract(capital, previousCapital)) / math.number(previousCapital) * 100).toFixed(2)}%)`,
-            fees: `$ ${math.number(math.add(entryFeeAmount, exitFeeAmount)).toFixed(3)}`,
-            entryFee: math.number(entryFeeAmount),
-            exitFee: math.number(exitFeeAmount),
-            rawPnl: math.number(profitLoss).toFixed(4),
-            tradeSize: math.number(positionSize),
-            size: `${math.round(notionalSize / markPrice) > 0 ? math.round(notionalSize / markPrice) : 1} contracts`, // Use notionalSize for contract size
-            notionalSize: `${math.number(notionalSize).toFixed(3)}`, // Use notionalSize here
-            margin: math.number(exposedAmount).toFixed(3),
-            marginRatio: math.number(math.multiply(math.divide(exposedAmount, capital), 100)).toFixed(3),
-            pnlROI: math.number(math.multiply(math.divide(profitLoss, exposedAmount), 100)).toFixed(4),
-            entryPrice: math.number(entryPrice),
-            breakEvenPrice: math.number(entryPrice), // Simplified break-even price
-            markPrice: math.number(markPrice),
-            liqPrice: math.number(markPrice * (1 - (1 / leverage))).toFixed(4), // Simplified liquidation price
-            tpSlInfo: `TP: $ ${math.number(tpPrice).toFixed(2)}, SL: $ ${math.number(slPrice).toFixed(2)}`,
-            exposedAmount: `$ ${math.number(exposedAmount).toFixed(2)} (${(math.number(positionSize) * 100).toFixed(2)}% balance $ ${math.number(previousCapital).toFixed(2)})`,
+        // Add the current stage's attempts to the simulation logs
+        simulationLogs.push({
+            stage: math.number(state.stageCount),
+            startingCapital: currencyFormatterUSD(math.number(state.stageStartCapital)),
+            targetCapital: currencyFormatterUSD(math.number(stageTarget)),
+            attempts: state.attempts
         });
-
-        // Check for excessive drawdown (stop if max drawdown exceeded)
-        const drawdown = math.subtract(1, math.divide(capital, highWaterMark));
-        if (math.larger(drawdown, maxDrawdown) || math.smaller(capital, 0)) {
-            console.log(chalk.red("\nMax drawdown exceeded or allocated capital depleted. Stopping simulation."));
-            console.log(chalk.gray(`Current Capital: `) + chalk.red(currencyFormatterUSD(math.number(capital))));
-            console.log(chalk.gray(`High Water Mark: `) + chalk.green(currencyFormatterUSD(math.number(highWaterMark))));
-            console.log(chalk.gray(`Drawdown: `) + chalk.red(`${math.number(math.multiply(drawdown, 100)).toFixed(2)}%`));
-            console.log(chalk.gray(`Max Drawdown Allowed: `) + chalk.red(`${math.number(math.multiply(maxDrawdown, 100)).toFixed(2)}%\n`));
-            return false;
-        }
-
-        return math.smaller(capital, targetCapitalBN);
-    };
-
-    // Main trading loop
-    const runTradingLoop = async () => {
-        while (true) {
-            const tradeSuccessful = await executeTrade();
-
-            // Break conditions
-            if (totalTrades >= 1000) {
-                console.log('Maximum number of trades reached. Stopping the trading loop.');
-                break;
-            }
-            if (!tradeSuccessful) {
-                console.log('Trade unsuccessful. Stopping the trading loop.');
-                break;
-            }
-            if (math.larger(capital, targetCapitalBN)) {
-                console.log(`Target capital of ${math.number(targetCapitalBN)} reached. Stopping the trading loop.`);
-                break;
-            }
-        }
-    };
-
-    // Start the trading loop and wait for it to finish
-    try {
-        await runTradingLoop();
-    } catch (error) {
-        console.error('Error in trading loop:', error);
-        throw error;
     }
 
-    // Calculate final statistics
-    const finalStats = {
-        totalTrades,
-        trades,
-        profitableTrades,
-        table: chalkTable(tableOptions, trades),
-        winRate: math.number(math.multiply(math.divide(math.bignumber(profitableTrades), math.bignumber(totalTrades)), 100)),
-        finalCapital: math.number(capital),
-        totalFees: math.number(totalFees),
-        returnOnInvestment: math.number(math.multiply(math.subtract(math.divide(capital, capitalBN), 1), 100)),
-        maxDrawdown: math.number(math.multiply(math.subtract(1, math.divide(math.bignumber(math.min(...trades.map(t => parseFloat(t.balance.replace(/[^0-9.-]+/g, ""))))), highWaterMark)), 100))
-    };
+    // Log the simulation results after the simulation completes
+    console.log(chalk.green('\nTrading Simulation Complete'));
+    console.log(chalk.gray('Final Capital: ') + chalk.green(currencyFormatterUSD(math.number(state.capital))));
+    console.log(chalk.gray('Total Savings: ') + chalk.green(currencyFormatterUSD(math.number(state.savings))));
+    console.log(chalk.gray('Net Worth: ') + chalk.green(currencyFormatterUSD(math.number(math.add(state.capital, state.savings)))));
 
-    return finalStats;
+    // Calculate the total number of trades
+    const totalTrades = simulationLogs.reduce((total, stageLog) => {
+        return total + stageLog.attempts.reduce((stageTotal, attempt) => {
+            return stageTotal + attempt.trades.length;
+        }, 0);
+    }, 0);
+
+    console.log(chalk.gray('Total Trades: ') + chalk.green(totalTrades));
+    console.log(chalk.gray('Completed Stages: ') + chalk.green(math.number(math.subtract(state.stageCount, math.bignumber(1)))));
+
+    return state;
 };
 
+const startingCapital = 1.00;
+const targetCapital = math.bignumber(5.00);
 
+runMultiStageTrading(startingCapital, targetCapital)
+// .catch(error => console.error('Simulation error:', error));
 
-
-let savings = math.bignumber(0);
-let savingsRate = 0.2; // Save 20% of profits at the end of each stage
-
-
-async function runSimulationInStages(startingCapital, targetGoal, winrate, leverage) {
-    let currentCapital = math.bignumber(startingCapital);
-    let overallTarget = math.bignumber(targetGoal);
-    let stageTargetMultiplier = math.bignumber(15.75);
-    let stageCount = 1;
-    let stageRetryCount = 0; // Counter to track retries for the current stage
-
-
-    while (math.smaller(currentCapital, overallTarget)) {
-        console.log(chalk.cyan(`\n=== Stage ${stageCount} (Attempt ${stageRetryCount + 1}) ===`));
-        console.log(chalk.yellow(`Starting capital: ${currencyFormatterUSD(math.number(currentCapital))}`));
-        console.log(chalk.yellow(`Savings: ${currencyFormatterUSD(math.number(savings))}`));
-
-        // Calculate next target
-        const nextTarget = math.min(
-            math.add(currentCapital, math.multiply(currentCapital, stageTargetMultiplier)),
-            overallTarget
-        );
-
-        console.log(chalk.yellow(`Target for this stage: ${currencyFormatterUSD(math.number(nextTarget))}`));
-
-        // Simulate trades for this stage
-        const result = await simulateTradesWithRiskManagement(
-            math.number(currentCapital),
-            winrate,
-            math.number(nextTarget),
-            leverage
-        );
-
-        console.log(result.table)
-
-        // Process results and update capital/savings
-        const stageProfit = math.subtract(math.bignumber(result.finalCapital), currentCapital);
-        if (math.larger(stageProfit, 0)) {
-            const savingsAmount = math.multiply(stageProfit, savingsRate);
-            savings = math.add(savings, savingsAmount);
-            currentCapital = math.subtract(math.bignumber(result.finalCapital), savingsAmount);
-            console.log(chalk.green(`Saved ${currencyFormatterUSD(math.number(savingsAmount))} to savings.`));
-        } else {
-            currentCapital = math.bignumber(result.finalCapital);
-        }
-
-        console.log(chalk.yellow(`Updated Capital: ${currencyFormatterUSD(math.number(currentCapital))}`));
-        console.log(chalk.yellow(`Total Savings: ${currencyFormatterUSD(math.number(savings))}`));
-
-        // Check if the stage goal is achieved
-        if (math.largerEq(math.bignumber(result.finalCapital), nextTarget)) {
-            console.log(chalk.green(`Stage ${stageCount} goal achieved!`));
-            stageCount++; // Increment stage count only if the goal is achieved
-            stageRetryCount = 0
-        } else {
-            console.log(chalk.red(`Stage ${stageCount} goal not achieved. Retrying stage.`));
-            stageRetryCount++;
-        }
-
-        // Check if maximum stages reached
-        if (stageCount > 10000) {
-            console.log(chalk.red('\nMaximum number of stages reached. Stopping simulation.'));
-            break;
-        }
-
-        // Check if overall target achieved
-        if (math.largerEq(math.add(currentCapital, savings), overallTarget)) {
-            console.log(chalk.green('\nCongratulations! Overall target achieved.'));
-            break;
-        }
-    }
-
-    // Log final results
-    console.log(chalk.green(`\nSimulation complete!`));
-    console.log(chalk.gray(`Final Trading Capital: `) + chalk.green(currencyFormatterUSD(math.number(currentCapital))));
-    console.log(chalk.gray(`Total Savings: `) + chalk.green(currencyFormatterUSD(math.number(savings))));
-    console.log(chalk.gray(`Overall Net Worth: `) + chalk.green(currencyFormatterUSD(math.add(currentCapital, savings))));
-
-    console.log(chalk.cyan('\nCombined Results for Longs and Shorts:'));
-    console.log(chalk.gray(`Total Long Trades: `) + chalk.green(totalLongs));
-    console.log(chalk.gray(`Total Short Trades: `) + chalk.green(totalShorts));
-    console.log(chalk.gray(`Total Long PnL: `) + chalk.green(currencyFormatterUSD(math.number(totalLongsPnl))));
-    console.log(chalk.gray(`Total Short PnL: `) + chalk.green(currencyFormatterUSD(math.number(totalShortsPnl))));
-    console.log(chalk.gray(`Total Long Size: `) + chalk.green(`${math.number(math.multiply(totalLongsSize, 100)).toFixed(2)}%`));
-    console.log(chalk.gray(`Total Short Size: `) + chalk.green(`${math.number(math.multiply(totalShortsSize, 100)).toFixed(2)}%`));
-    console.log(chalk.gray(`Total Long Fees: `) + chalk.green(currencyFormatterUSD(math.number(totalLongsFees))));
-    console.log(chalk.gray(`Total Short Fees: `) + chalk.green(currencyFormatterUSD(math.number(totalShortsFees))));
-    console.log(chalk.gray(`Total Long Notional Size: `) + chalk.green(currencyFormatterUSD(math.number(totalLongsNotionalSize))));
-    console.log(chalk.gray(`Total Short Notional Size: `) + chalk.green(currencyFormatterUSD(math.number(totalShortsNotionalSize))));
-    console.log(chalk.gray(`Total Long Margin: `) + chalk.green(currencyFormatterUSD(math.number(totalLongsMargin))));
-    console.log(chalk.gray(`Total Short Margin: `) + chalk.green(currencyFormatterUSD(math.number(totalShortsMargin))));
-    console.log(chalk.gray(`Total Long Margin Ratio: `) + chalk.green(`${math.number(math.multiply(totalLongsMarginRatio, 100)).toFixed(2)}%`));
-    console.log(chalk.gray(`Total Short Margin Ratio: `) + chalk.green(`${math.number(math.multiply(totalShortsMarginRatio, 100)).toFixed(2)}%`));
-    console.log(chalk.gray(`Total Long PnL ROI: `) + chalk.green(`${math.number(math.multiply(totalLongsPnlROI, 100)).toFixed(2)}%`));
-    console.log(chalk.gray(`Total Short PnL ROI: `) + chalk.green(`${math.number(math.multiply(totalShortsPnlROI, 100)).toFixed(2)}%`));
-    // Example for losses in red:
-    if (totalLongsPnl < 0) {
-        console.log(chalk.red(`Loss in Long PnL: `) + chalk.green(currencyFormatterUSD(totalLongsPnl)));
-    }
-    if (totalShortsPnl < 0) {
-        console.log(chalk.red(`Loss in Short PnL: `) + chalk.green(currencyFormatterUSD(totalShortsPnl)));
-    }
-}
-
-// Example usage
-const innitialStartingCapital = 1.00; // Initial capital in USDT
-const targetGoal = math.bignumber(5); // Final goal in USDT
-
-runSimulationInStages(innitialStartingCapital, targetGoal, winrate, leverage);
+module.exports = {
+    runMultiStageTrading,
+    calculatePositionSize,
+    executeTrade
+};
